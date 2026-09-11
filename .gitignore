@@ -1,0 +1,19 @@
+# Environnements et caches Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Outils de qualité et packaging
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Artefacts locaux d'entraînement
+checkpoints/
+logs/
+runs/
+
+# Configuration locale
+.env
