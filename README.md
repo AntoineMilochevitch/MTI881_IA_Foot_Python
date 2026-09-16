@@ -4,7 +4,7 @@ Backend Python dédié à l'entraînement, avec PyTorch, d'un agent d'apprentiss
 
 Le moteur Unity est responsable de toute la simulation : physique, collisions, règles de match, rendu et progression temporelle. Ce dépôt n'implémente donc **ni simulateur, ni physique, ni environnement factice**. Il définit uniquement les contrats Python qui seront reliés au moteur par un pont TCP/UDP.
 
-Le projet commence en **1v1** et est structuré pour évoluer vers des équipes et du multi-agents.
+Le projet commence en **1v1** et est amené à évoluer vers des équipes et du multi-agents.
 
 ## Architecture
 
@@ -48,8 +48,6 @@ Sous macOS/Linux, l'activation devient :
 ```bash
 source .venv/bin/activate
 ```
-
-> Les dépendances sont épinglées aux versions les plus récentes au moment de cette mise à jour. PyTorch peut nécessiter une commande d'installation adaptée au GPU et à la version CUDA de la machine.
 
 ## Contrat Unity ↔ Python
 
@@ -114,12 +112,4 @@ La composition des récompenses sera implémentée dans `rewards.py`, à partir 
 - **Défense** : récompense importante pour l'interception d'un tir dangereux, notamment par saut ou tacle.
 - **Pénalités** : faible coût temporel à chaque frame et pénalité lors d'une sortie de terrain.
 
-Les coefficients, plafonds et règles d'attribution seront versionnés avec la configuration de l'expérience afin de conserver des entraînements reproductibles et d'éviter de modifier le signal de récompense silencieusement.
-
-## Feuille de route immédiate
-
-1. Définir le protocole de messages Unity/Python et implémenter le client TCP/UDP.
-2. Relier les appels réseau aux coquilles `reset()` et `step()` de l'environnement Gymnasium.
-3. Valider les unités, repères, bornes et normalisations avec Unity.
-4. Choisir puis implémenter de zéro l'algorithme RL et ses réseaux PyTorch.
-5. Étendre le schéma à des effectifs fixes, puis au multi-agents.
+Les coefficients, plafonds et règles d'attribution seront versionnés avec la configuration de l'expérience afin de conserver des entraînements reproductibles et d'éviter de modifier le signal de récompense silencieusement
