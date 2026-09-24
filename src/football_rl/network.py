@@ -1,19 +1,19 @@
-"""Interfaces PyTorch des futurs réseaux de politiques et de valeurs."""
+"""Contrat PyTorch sans imposer un algorithme ou une architecture de réseau."""
+
+from abc import ABC, abstractmethod
 
 import torch
 from torch import nn
 
 
-class ActorCriticNetwork(nn.Module):
-    """Contrat d'un réseau PyTorch partagé par politique et estimateur de valeur."""
+class FootballNetwork(nn.Module, ABC):
+    """Base des réseaux comparés, avec une entrée fixe incluant les masques."""
 
     def __init__(self, observation_size: int) -> None:
-        """Initialise le futur réseau à partir de la dimension d'observation."""
-        pass
+        super().__init__()
+        self.observation_size = observation_size
 
-    def forward(
-        self,
-        observations: torch.Tensor,
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        """Retourne les sorties de politique hybrides et la valeur d'état."""
-        pass
+    @abstractmethod
+    def forward(self, observations: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Sorties et exploitation des masques à définir selon l'algorithme."""
+        raise NotImplementedError

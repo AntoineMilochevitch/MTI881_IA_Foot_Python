@@ -1,45 +1,37 @@
-"""Interfaces des agents d'apprentissage par renforcement."""
+"""Interface commune aux algorithmes RL entraînés avec PyTorch."""
 
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 import torch
 
-from football_rl.types import FootballAction, Observation
+from football_rl.types import EpisodeBatch, FootballAction, ModelArtifact, Observation
 
 
 class FootballAgent(ABC):
-    """Interface commune aux futurs agents RL implémentés avec PyTorch."""
+    """Apprentissage sur les lots Unity, puis export du réseau mis à jour."""
 
     @abstractmethod
     def select_action(self, observation: Observation) -> FootballAction:
-        """Sélectionne une action à partir d'une observation normalisée."""
-        pass
+        """Interface Python de politique ; l'exécution en jeu se fait dans Unity."""
+        raise NotImplementedError
 
     @abstractmethod
-    def observe(
-        self,
-        observation: Observation,
-        action: FootballAction,
-        reward: float,
-        next_observation: Observation,
-        terminated: bool,
-        truncated: bool,
-    ) -> None:
-        """Enregistre une transition pour la future phase d'apprentissage."""
-        pass
+    def update(self, batch: EpisodeBatch) -> dict[str, float]:
+        """Entraîne le réseau sur un lot et retourne les métriques d'apprentissage."""
+        raise NotImplementedError
 
     @abstractmethod
-    def update(self) -> dict[str, float]:
-        """Met à jour les paramètres de l'agent à partir des transitions."""
-        pass
+    def export_model(self) -> ModelArtifact:
+        """Exporte le réseau pour Unity dans un format restant à définir."""
+        raise NotImplementedError
 
     @abstractmethod
     def save(self, path: Path) -> None:
         """Sauvegarde l'état entraînable de l'agent."""
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def load(self, path: Path, device: torch.device) -> None:
         """Charge l'état entraînable de l'agent sur le périphérique demandé."""
-        pass
+        raise NotImplementedError
