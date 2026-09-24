@@ -4,6 +4,7 @@ Backend Python pour comparer plusieurs algorithmes d'apprentissage par renforcem
 
 L'apprentissage commence en **1v1**, puis évolue vers le jeu en équipe afin d'étudier les comportements coopératifs.
 
+Le projet commence en **1v1** et est structuré pour évoluer vers des équipes et du multi-agents.
 
 ## Architecture
 
