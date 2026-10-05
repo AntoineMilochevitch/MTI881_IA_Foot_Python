@@ -30,8 +30,8 @@ class ObservationLayout:
     max_opponents: int
 
     def __post_init__(self) -> None:
-        if self.max_teammates < 0 or self.max_opponents < 1:
-            raise ValueError("Prévoir au moins zéro coéquipier et un adversaire.")
+        if self.max_teammates < 0 or self.max_opponents < 0:
+            raise ValueError("Prévoir au moins zéro coéquipier et zéro adversaire.")
 
     @property
     def size(self) -> int:
