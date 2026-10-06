@@ -6,6 +6,8 @@ L'apprentissage commence en **1v1**, puis évolue vers le jeu en équipe afin d'
 
 Le projet commence en **1v1** et est structuré pour évoluer vers des équipes et du multi-agents.
 
+La [documentation PPO](README_PPO.md) explique les réseaux déjà construits, leur rôle dans Unity, les calculs d'apprentissage et les prochaines étapes.
+
 ## Architecture
 
 ```text
@@ -13,6 +15,7 @@ Le projet commence en **1v1** et est structuré pour évoluer vers des équipes 
 ├── pyproject.toml
 ├── requirements.txt
 ├── README.md
+├── README_PPO.md
 └── src/
     └── football_rl/
         ├── __init__.py
@@ -20,6 +23,7 @@ Le projet commence en **1v1** et est structuré pour évoluer vers des équipes 
         ├── communication.py  # Réception des épisodes et envoi du réseau à Unity
         ├── env.py            # Interface Gymnasium, raccordement à définir
         ├── network.py        # Base PyTorch commune aux futurs réseaux
+        ├── ppo_network.py    # Critique et politique de déplacement PPO
         ├── rewards.py        # Composantes et coefficients à déterminer
         ├── train.py          # Contrat d'orchestration et configuration
         └── types.py          # Observations, actions, épisodes, lots et modèle
@@ -72,7 +76,7 @@ Unity : chargement du réseau mis à jour ←───────┘
 
 `UnityTrainingBridge` décrit la réception d'un `EpisodeBatch` et l'envoi d'un `ModelArtifact`. Les types Python représentent les échanges attendus ; leur sérialisation, le protocole de communication et le format du réseau exporté restent à choisir selon les contraintes de performance et de simplicité. Cette organisation s'inspire de ML-Agents sans imposer son utilisation.
 
-`Football3DEnv` fournit le contrat d'une interface compatible Gymnasium. Son raccordement à Unity et son articulation avec la collecte par lots restent à préciser. Ses méthodes `reset()` et `step()` ne sont pas implémentées.
+`Football3DEnv` fournit le contrat d'une interface compatible Gymnasium. Ses méthodes `reset()` et `step()` proposent actuellement des observations factices, sans effet des actions et avec une récompense nulle. Le raccordement à Unity et son articulation avec la collecte par lots restent à préciser.
 
 ## Observations
 
