@@ -1,4 +1,4 @@
-# Comprendre l'implémentation PPO du projet
+# Comprendre l'implémentation PPO (Proximal Policy Optimization) du projet
 
 Ce document explique les réseaux déjà écrits dans [ppo_network.py](src/football_rl/ppo_network.py), leur futur rôle dans Unity et les étapes nécessaires à un entraînement PPO complet. Il complète le [README du projet](README.md).
 
@@ -180,7 +180,7 @@ $$
 
 Les récompenses viendront des événements et règles du projet. Leurs coefficients ne sont pas fixés par ce document. PPO permet plusieurs passages sur un même lot récent avant une nouvelle collecte. [Publication PPO](https://arxiv.org/abs/1707.06347)
 
-### Avantage et GAE
+### Avantage et GAE (Generalized Advantage Estimation)
 
 L'avantage estime si une action a produit un résultat meilleur ou moins bon que prévu. Un avantage positif favorise sa probabilité ; un avantage négatif encourage à la réduire. Une récompense immédiate positive peut néanmoins correspondre à un avantage négatif si la suite est décevante.
 

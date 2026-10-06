@@ -75,6 +75,8 @@ class PPOActorNetwork(FootballNetwork):
 
         self.jump_head = nn.Linear(128, 1)
 
+        self.tackle_head = nn.Linear(128, 1)
+
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Retourne mean et log_std, chacun de forme (B, 3), sans tirage."""
         features = self.network(x)
@@ -82,8 +84,9 @@ class PPOActorNetwork(FootballNetwork):
         mean = self.mean(features)
         log_std = self.log_std_head(features)
         jump_logit = self.jump_head(features)
+        tackle_logit = self.tackle_head(features)
 
-        return {"mean": mean, "log_std": log_std, "jump_logit": jump_logit}
+        return {"mean": mean, "log_std": log_std, "jump_logit": jump_logit, "tackle_logit": tackle_logit}
 
     def sample_move(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Choisit des déplacements et calcule leur log-densité.
@@ -189,6 +192,35 @@ class PPOActorNetwork(FootballNetwork):
 
         return log_prob
 
+    def sample_tackle(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Échantillonne un tacle binaire et calcule sa log-densité.
+
+        Retourne tackle_target (B,) et log_prob (B,). tackle_target est la
+        cible destinée à Unity, valide uniquement si enable_tackle est actif.
+        """
+        outputs = self.forward(x)
+        tackle_logit = outputs["tackle_logit"].squeeze(-1)  # (B, 1) -> (B,)
+
+        dist = torch.distributions.Bernoulli(logits=tackle_logit)
+        tackle_target = dist.sample()  # (B,)
+        log_prob = dist.log_prob(tackle_target)  # (B,)
+
+        return {"tackle_target": tackle_target, "log_prob": log_prob}
+
+    def evaluate_tackle(self, x: torch.Tensor, tackle_target: torch.Tensor) -> torch.Tensor:
+        """Recalcule la log-densité d'un tacle enregistré, sans tirage.
+
+        x : observations (B, D) ; tackle_target : données fixes (B,), détachées
+        du graphe de collecte. Retour : log-densités (B,) reliées aux poids
+        actuels de l'acteur.
+        """
+        outputs = self.forward(x)
+        tackle_logit = outputs["tackle_logit"].squeeze(-1)  # (B, 1) -> (B,)
+
+        dist = torch.distributions.Bernoulli(logits=tackle_logit)
+        log_prob = dist.log_prob(tackle_target)  # (B,)
+
+        return log_prob
 
 if __name__ == "__main__":
     # Démonstration numérique exécutée avec python -m football_rl.ppo_network.
@@ -273,19 +305,40 @@ if __name__ == "__main__":
         f"{jump_log_prob_1_evaluated.shape}\n"
     )  # Attendu: (1,)
 
-    # --- 6. Rétropropagation ---
+    # --- 6. Tackles ---
+    sampled_tackle_8 = actor.sample_tackle(obs_8)
+    tackle_target_8 = sampled_tackle_8["tackle_target"]
+    tackle_log_prob_8_sampled = sampled_tackle_8["log_prob"]
+    tackle_log_prob_8_evaluated = actor.evaluate_tackle(
+        obs_8, tackle_target_8.detach()
+    )
+
+    print("--- Vérification des tackles ---")
+    print(f"Cible de tackle 8 obs : {tackle_target_8.shape}")  # Attendu: (8,)
+    print(
+        "Valeurs de tackle valides (0 ou 1) : "
+        f"{bool(torch.all((tackle_target_8 == 0) | (tackle_target_8 == 1)))}"
+    )
+    print(
+        "Proximité numérique entre sample et evaluate (tackle) : "
+        f"{torch.allclose(tackle_log_prob_8_sampled, tackle_log_prob_8_evaluated)}\n"
+    )
+
+    # --- 7. Rétropropagation ---
     # Objectif de diagnostic uniquement : vérifie que les deux têtes reçoivent
     # des gradients. backward() les calcule sans modifier les poids du réseau.
     loss = -(
-        log_prob_8_evaluated.mean() + jump_log_prob_8_evaluated.mean()
+        log_prob_8_evaluated.mean() + jump_log_prob_8_evaluated.mean() + tackle_log_prob_8_sampled.mean()
     )
     loss.backward()
     
     grad_mean = actor.mean.weight.grad
     grad_log_std = actor.log_std_head.weight.grad
     grad_jump = actor.jump_head.weight.grad
+    grad_tackle = actor.tackle_head.weight.grad
     
     print("--- Vérification des gradients ---")
     print(f"Gradient présent (mean)    : {grad_mean is not None}")
     print(f"Gradient présent (log_std_head) : {grad_log_std is not None}")
     print(f"Gradient présent (jump_head) : {grad_jump is not None}")
+    print(f"Gradient présent (tackle_head) : {grad_tackle is not None}")
