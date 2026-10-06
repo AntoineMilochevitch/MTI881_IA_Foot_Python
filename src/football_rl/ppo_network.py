@@ -77,6 +77,11 @@ class PPOActorNetwork(FootballNetwork):
 
         self.tackle_head = nn.Linear(128, 1)
 
+        self.shoot_trigger_head = nn.Linear(128, 1)
+        self.shoot_alpha_head = nn.Linear(128, 1)
+        self.shoot_beta_head = nn.Linear(128, 1)
+
+
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Retourne mean et log_std, chacun de forme (B, 3), sans tirage."""
         features = self.network(x)
@@ -85,8 +90,19 @@ class PPOActorNetwork(FootballNetwork):
         log_std = self.log_std_head(features)
         jump_logit = self.jump_head(features)
         tackle_logit = self.tackle_head(features)
+        shoot_trigger_logit = self.shoot_trigger_head(features)
+        shoot_alpha_raw = self.shoot_alpha_head(features)
+        shoot_beta_raw = self.shoot_beta_head(features)
 
-        return {"mean": mean, "log_std": log_std, "jump_logit": jump_logit, "tackle_logit": tackle_logit}
+        return {
+            "mean": mean,
+            "log_std": log_std,
+            "jump_logit": jump_logit,
+            "tackle_logit": tackle_logit,
+            "shoot_trigger_logit": shoot_trigger_logit,
+            "shoot_alpha_raw": shoot_alpha_raw,
+            "shoot_beta_raw": shoot_beta_raw
+        }
 
     def sample_move(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Choisit des déplacements et calcule leur log-densité.
@@ -222,6 +238,61 @@ class PPOActorNetwork(FootballNetwork):
 
         return log_prob
 
+    def sample_shoot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Échantillonne une intensité de frappe, avec zéro possible exactement.
+
+            Modèle en deux étapes ("hurdle") : un déclenchement binaire décide si
+            une frappe a lieu, puis une intensité continue dans (0, 1) est tirée
+            seulement si déclenché. L'intensité vaut exactement 0 sinon.
+
+            Retourne trigger (B,), intensity (B,), shoot_target (B,) et log_prob (B,).
+            """
+        outputs = self.forward(x)
+
+        trigger_logit = outputs["shoot_trigger_logit"].squeeze(-1)  # (B, 1) -> (B,)
+
+        # softplus garantit la positivité, +1 évite les distributions instables en début d'entraînement (quand poids proches de 0).
+        alpha = F.softplus(outputs["shoot_alpha_raw"]).squeeze(-1) + 1.0
+        beta = F.softplus(outputs["shoot_beta_raw"]).squeeze(-1) + 1.0
+
+        # 1. Décide si une frappe a lieu
+        trigger_dist = torch.distributions.Bernoulli(logits=trigger_logit)
+        trigger = trigger_dist.sample()
+
+        # 2. Intensité de la frappe (éventuellement annulée si trigger 0
+        beta_dist = torch.distributions.Beta(alpha, beta)
+        intensity = beta_dist.sample()
+
+        shoot_target = trigger * intensity
+
+        trigger_log_prob = trigger_dist.log_prob(trigger)
+        intensity_log_prob = beta_dist.log_prob(intensity)
+        log_prob = trigger_log_prob + trigger * intensity_log_prob
+
+        return {"trigger": trigger, "intensity": intensity, "shoot_target": shoot_target, "log_prob": log_prob}
+
+    def evaluate_shoot(self, x: torch.Tensor, trigger: torch.Tensor, intensity: torch.Tensor) -> torch.Tensor:
+        """Recalcule la log-densité d'un frappe enregistré, sans tirage.
+
+        x : observations (B, D) ; trigger (B,) et intensity (B,) : données
+        fixes, détachées du graphe de collecte. Retour : log-densités (B,)
+        reliées aux poids actuels de l'acteur.
+        """
+        outputs = self.forward(x)
+        trigger_logit = outputs["shoot_trigger_logit"].squeeze(-1)
+        alpha = F.softplus(outputs["shoot_alpha_raw"]).squeeze(-1) + 1.0
+        beta = F.softplus(outputs["shoot_beta_raw"]).squeeze(-1) + 1.0
+
+        trigger_dist = torch.distributions.Bernoulli(logits=trigger_logit)
+        beta_dist = torch.distributions.Beta(alpha, beta)
+
+        trigger_log_prob = trigger_dist.log_prob(trigger)
+        intensity_log_prob = beta_dist.log_prob(intensity)
+        log_prob = trigger_log_prob + trigger * intensity_log_prob
+
+        return log_prob
+
+
 if __name__ == "__main__":
     # Démonstration numérique exécutée avec python -m football_rl.ppo_network.
     # Aucun optimiseur : ces vérifications n'entraînent pas une politique PPO.
@@ -324,11 +395,40 @@ if __name__ == "__main__":
         f"{torch.allclose(tackle_log_prob_8_sampled, tackle_log_prob_8_evaluated)}\n"
     )
 
-    # --- 7. Rétropropagation ---
-    # Objectif de diagnostic uniquement : vérifie que les deux têtes reçoivent
+    # --- 7. Shoot ---
+    sampled_shoot_8 = actor.sample_shoot(obs_8)
+    trigger_8 = sampled_shoot_8["trigger"]
+    intensity_8 = sampled_shoot_8["intensity"]
+    shoot_target_8 = sampled_shoot_8["shoot_target"]
+    shoot_log_prob_8_sampled = sampled_shoot_8["log_prob"]
+
+    shoot_log_prob_8_evaluated = actor.evaluate_shoot(
+        obs_8, trigger_8.detach(), intensity_8.detach()
+    )
+
+    print("--- Vérification des shoots ---")
+    print(f"Cible de shoot 8 obs : {shoot_target_8.shape}")  # Attendu: (8,)
+    print(
+        "Valeurs de shoot valides dans [0 ou 1] : "
+        f"{bool(torch.all((shoot_target_8 >= 0) | (shoot_target_8 <= 1)))}"
+    )
+    print(
+        "Au moins un shoot exactement nul (si l'échantillon est assez grand) : "
+        f"{bool(torch.any(shoot_target_8 == 0.0))}"
+    )
+    print(
+        "Proximité numérique entre sample et evaluate (shoot) : "
+        f"{torch.allclose(shoot_log_prob_8_sampled, shoot_log_prob_8_evaluated)}\n"
+    )
+
+    # --- 8. Rétropropagation ---
+    # Objectif de diagnostic uniquement : vérifie que les têtes reçoivent
     # des gradients. backward() les calcule sans modifier les poids du réseau.
     loss = -(
-        log_prob_8_evaluated.mean() + jump_log_prob_8_evaluated.mean() + tackle_log_prob_8_sampled.mean()
+        log_prob_8_evaluated.mean()
+        + jump_log_prob_8_evaluated.mean()
+        + tackle_log_prob_8_evaluated.mean()
+        + shoot_log_prob_8_evaluated.mean()
     )
     loss.backward()
     
@@ -336,9 +436,15 @@ if __name__ == "__main__":
     grad_log_std = actor.log_std_head.weight.grad
     grad_jump = actor.jump_head.weight.grad
     grad_tackle = actor.tackle_head.weight.grad
+    grad_shoot_trigger = actor.shoot_trigger_head.weight.grad
+    grad_shoot_alpha = actor.shoot_alpha_head.weight.grad
+    grad_shoot_beta = actor.shoot_beta_head.weight.grad
     
     print("--- Vérification des gradients ---")
     print(f"Gradient présent (mean)    : {grad_mean is not None}")
     print(f"Gradient présent (log_std_head) : {grad_log_std is not None}")
     print(f"Gradient présent (jump_head) : {grad_jump is not None}")
     print(f"Gradient présent (tackle_head) : {grad_tackle is not None}")
+    print(f"Gradient présent (shoot_trigger_head) : {grad_shoot_trigger is not None}")
+    print(f"Gradient présent (shoot_alpha_head) : {grad_shoot_alpha is not None}")
+    print(f"Gradient présent (shoot_beta_head) : {grad_shoot_beta is not None}")
