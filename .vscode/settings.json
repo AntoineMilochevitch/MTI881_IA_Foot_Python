@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv",
+    "python.analysis.extraPaths": [
+        "./src",
+        "../MTI881_IA_Foot_Unity/python"
+    ]
+}
