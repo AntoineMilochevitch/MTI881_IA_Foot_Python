@@ -292,159 +292,42 @@ class PPOActorNetwork(FootballNetwork):
 
         return log_prob
 
+    def sample_action(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Échantillonne un déplacement, un saut, un tacle et une frappe.
 
-if __name__ == "__main__":
-    # Démonstration numérique exécutée avec python -m football_rl.ppo_network.
-    # Aucun optimiseur : ces vérifications n'entraînent pas une politique PPO.
-    actor = PPOActorNetwork(observation_size=57)
+        Retourne un dictionnaire avec toutes les cibles et log-probabilités.
+        """
+        move = self.sample_move(x)
+        jump = self.sample_jump(x)
+        tackle = self.sample_tackle(x)
+        shoot = self.sample_shoot(x)
 
-    # --- 1. Formes ---
-    # Ces entrées aléatoires contrôlent les dimensions ; elles ne décrivent
-    # pas un état de match cohérent ni nécessairement normalisé dans [-1, 1].
-    obs_8 = torch.randn(8, 57)
-    sampled_8 = actor.sample_move(obs_8)
-    raw_move_8 = sampled_8['raw_move']
-    log_prob_8_sampled = sampled_8['log_prob']
-    
-    # Détacher raw_move pour simuler une donnée fixe venant d'un buffer de collecte
-    raw_move_fixe = raw_move_8.detach()
-    log_prob_8_evaluated = actor.evaluate_move(obs_8, raw_move_fixe)
-    
-    print("--- Vérification des formes ---")
-    print(f"Log-prob 8 obs (evaluate) : {log_prob_8_evaluated.shape}") # Attendu: (8,)
-    
-    obs_1 = torch.randn(1, 57)
-    raw_move_1 = actor.sample_move(obs_1)['raw_move'].detach()
-    log_prob_1_evaluated = actor.evaluate_move(obs_1, raw_move_1)
-    print(f"Log-prob 1 obs (evaluate) : {log_prob_1_evaluated.shape}\n") # Attendu: (1,)
-    
-    # --- 2. Finitude ---
-    is_finite = torch.isfinite(log_prob_8_evaluated).all().item()
-    print("--- Vérification des valeurs ---")
-    print(f"Toutes les log-probabilités sont finies : {is_finite}")
-    
-    # --- 3. Cohérence numérique entre échantillonnage et évaluation ---
-    # allclose utilise des tolérances. Cette comparaison vérifie la cohérence
-    # des deux chemins avec les mêmes poids, pas à elle seule la formule.
-    sont_egales = torch.allclose(log_prob_8_sampled, log_prob_8_evaluated)
-    print(f"Proximité numérique entre sample et evaluate : {sont_egales}\n")
-    
-    # --- 4. Le point de repère mathématique (-2.7568) ---
-    dummy_mean = torch.zeros(1, 3)
-    dummy_std = torch.ones(1, 3)
-    dummy_raw = torch.zeros(1, 3)
-    
-    dist_test = torch.distributions.Normal(dummy_mean, dummy_std)
-    lp_raw_test = dist_test.log_prob(dummy_raw)
-    # Pour u = 0, la correction est nulle : on retrouve -3/2 * log(2*pi).
-    corr_test = 2 * (math.log(2) - dummy_raw - F.softplus(-2 * dummy_raw))
-    lp_total_test = (lp_raw_test - corr_test).sum(dim=-1)
-    print(f"Sanity check sur N(0,1) en (0,0,0) : {lp_total_test.item():.4f}\n")
-    
-    # --- 5. Jumps ---
-    sampled_jump_8 = actor.sample_jump(obs_8)
-    jump_target_8 = sampled_jump_8["jump_target"]
-    jump_log_prob_8_sampled = sampled_jump_8["log_prob"]
-    jump_log_prob_8_evaluated = actor.evaluate_jump(
-        obs_8, jump_target_8.detach()
-    )
+        sum_log_prob = move["log_prob"] + jump["log_prob"] + tackle["log_prob"] + shoot["log_prob"]
 
-    print("--- Vérification des jumps ---")
-    print(f"Cible de jump 8 obs : {jump_target_8.shape}")  # Attendu: (8,)
-    print(
-        "Valeurs de jump valides (0 ou 1) : "
-        f"{bool(torch.all((jump_target_8 == 0) | (jump_target_8 == 1)))}"
-    )
-    print(
-        "Log-prob 8 jumps (evaluate) : "
-        f"{jump_log_prob_8_evaluated.shape}"
-    )  # Attendu: (8,)
-    print(
-        "Log-probabilités de jump finies : "
-        f"{bool(torch.isfinite(jump_log_prob_8_evaluated).all())}"
-    )
-    print(
-        "Proximité numérique entre sample et evaluate (jump) : "
-        f"{torch.allclose(jump_log_prob_8_sampled, jump_log_prob_8_evaluated)}\n"
-    )
+        return {
+            "move_target": move["move_target"],
+            "jump": jump["jump_target"],
+            "tackle": tackle["tackle_target"],
+            "shoot": shoot["shoot_target"].unsqueeze(-1),  # (B,) -> (B, 1) pour Unity
+            "raw_move": move["raw_move"],
+            "trigger": shoot["trigger"],
+            "intensity": shoot["intensity"],
+            "log_prob": sum_log_prob
+        }
 
-    obs_jump_1 = torch.randn(1, 57)
-    jump_target_1 = actor.sample_jump(obs_jump_1)["jump_target"].detach()
-    jump_log_prob_1_evaluated = actor.evaluate_jump(obs_jump_1, jump_target_1)
-    print(
-        "Log-prob 1 jump (evaluate) : "
-        f"{jump_log_prob_1_evaluated.shape}\n"
-    )  # Attendu: (1,)
+    def evaluate_action(self, x: torch.Tensor, raw_move: torch.Tensor, jump: torch.Tensor, tackle: torch.Tensor, trigger: torch.Tensor, intensity: torch.Tensor) -> torch.Tensor:
+        """Recalcule la log-densité d'une action enregistrée, sans tirage.
 
-    # --- 6. Tackles ---
-    sampled_tackle_8 = actor.sample_tackle(obs_8)
-    tackle_target_8 = sampled_tackle_8["tackle_target"]
-    tackle_log_prob_8_sampled = sampled_tackle_8["log_prob"]
-    tackle_log_prob_8_evaluated = actor.evaluate_tackle(
-        obs_8, tackle_target_8.detach()
-    )
+        x : observations (B, D) ; raw_move (B, 3), jump (B,), tackle (B,),
+        trigger (B,) et intensity (B,) : données fixes, détachées du graphe
+        de collecte. Retour : log-densités (B,) reliées aux poids actuels
+        de l'acteur.
+        """
+        move_log_prob = self.evaluate_move(x, raw_move)
+        jump_log_prob = self.evaluate_jump(x, jump)
+        tackle_log_prob = self.evaluate_tackle(x, tackle)
+        shoot_log_prob = self.evaluate_shoot(x, trigger, intensity)
 
-    print("--- Vérification des tackles ---")
-    print(f"Cible de tackle 8 obs : {tackle_target_8.shape}")  # Attendu: (8,)
-    print(
-        "Valeurs de tackle valides (0 ou 1) : "
-        f"{bool(torch.all((tackle_target_8 == 0) | (tackle_target_8 == 1)))}"
-    )
-    print(
-        "Proximité numérique entre sample et evaluate (tackle) : "
-        f"{torch.allclose(tackle_log_prob_8_sampled, tackle_log_prob_8_evaluated)}\n"
-    )
+        sum_log_prob = move_log_prob + jump_log_prob + tackle_log_prob + shoot_log_prob
 
-    # --- 7. Shoot ---
-    sampled_shoot_8 = actor.sample_shoot(obs_8)
-    trigger_8 = sampled_shoot_8["trigger"]
-    intensity_8 = sampled_shoot_8["intensity"]
-    shoot_target_8 = sampled_shoot_8["shoot_target"]
-    shoot_log_prob_8_sampled = sampled_shoot_8["log_prob"]
-
-    shoot_log_prob_8_evaluated = actor.evaluate_shoot(
-        obs_8, trigger_8.detach(), intensity_8.detach()
-    )
-
-    print("--- Vérification des shoots ---")
-    print(f"Cible de shoot 8 obs : {shoot_target_8.shape}")  # Attendu: (8,)
-    print(
-        "Valeurs de shoot valides dans [0 ou 1] : "
-        f"{bool(torch.all((shoot_target_8 >= 0) | (shoot_target_8 <= 1)))}"
-    )
-    print(
-        "Au moins un shoot exactement nul (si l'échantillon est assez grand) : "
-        f"{bool(torch.any(shoot_target_8 == 0.0))}"
-    )
-    print(
-        "Proximité numérique entre sample et evaluate (shoot) : "
-        f"{torch.allclose(shoot_log_prob_8_sampled, shoot_log_prob_8_evaluated)}\n"
-    )
-
-    # --- 8. Rétropropagation ---
-    # Objectif de diagnostic uniquement : vérifie que les têtes reçoivent
-    # des gradients. backward() les calcule sans modifier les poids du réseau.
-    loss = -(
-        log_prob_8_evaluated.mean()
-        + jump_log_prob_8_evaluated.mean()
-        + tackle_log_prob_8_evaluated.mean()
-        + shoot_log_prob_8_evaluated.mean()
-    )
-    loss.backward()
-    
-    grad_mean = actor.mean.weight.grad
-    grad_log_std = actor.log_std_head.weight.grad
-    grad_jump = actor.jump_head.weight.grad
-    grad_tackle = actor.tackle_head.weight.grad
-    grad_shoot_trigger = actor.shoot_trigger_head.weight.grad
-    grad_shoot_alpha = actor.shoot_alpha_head.weight.grad
-    grad_shoot_beta = actor.shoot_beta_head.weight.grad
-    
-    print("--- Vérification des gradients ---")
-    print(f"Gradient présent (mean)    : {grad_mean is not None}")
-    print(f"Gradient présent (log_std_head) : {grad_log_std is not None}")
-    print(f"Gradient présent (jump_head) : {grad_jump is not None}")
-    print(f"Gradient présent (tackle_head) : {grad_tackle is not None}")
-    print(f"Gradient présent (shoot_trigger_head) : {grad_shoot_trigger is not None}")
-    print(f"Gradient présent (shoot_alpha_head) : {grad_shoot_alpha is not None}")
-    print(f"Gradient présent (shoot_beta_head) : {grad_shoot_beta is not None}")
+        return sum_log_prob
