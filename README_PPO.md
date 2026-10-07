@@ -1,282 +1,279 @@
-# Comprendre l'implémentation PPO (Proximal Policy Optimization) du projet
+# Construire PPO pour le football Unity
 
-Ce document explique les réseaux déjà écrits dans [ppo_network.py](src/football_rl/ppo_network.py), leur futur rôle dans Unity et les étapes nécessaires à un entraînement PPO complet. Il complète le [README du projet](README.md).
+Ce document décrit le code actuel et les étapes d'apprentissage à réaliser.
+Le [README général](README.md) précise les observations/actions et le
+[guide du pont](README_UNITY.md) explique l'installation et la collecte.
 
-**État actuel : un critique et une politique de déplacement sont implémentés.** Le saut, la frappe, le tacle optionnel, le buffer, les avantages, les pertes PPO, les optimiseurs et l'export vers Unity restent à construire. Les vérifications actuelles portent sur les calculs des réseaux ; aucun apprentissage du football n'est encore réalisé.
+## 1. État de l'implémentation
 
-## 1. Acteur, politique et critique
+| Composant | État |
+| --- | --- |
+| `PPOActorNetwork.__init__` et `forward` | Implémentés pour le schéma Unity |
+| `PPOValueNetwork` | Implémenté |
+| `export_actor` | Implémenté avec le modèle et le décodeur du pont |
+| Envoi de l'acteur / réception des lots | Disponible dans `football_rl.ppo_unity` via le collecteur commun |
+| `sample_action` / `evaluate_action` en Python | À écrire pour les sept commandes |
+| Buffer, GAE, pertes et optimisations PPO | À écrire |
+| Checkpoints, suivi TensorBoard et évaluation | À écrire |
 
-Un MLP est un réseau de neurones composé de couches entièrement connectées et d'activations non linéaires. Les deux MLP du projet reçoivent la même observation, mais apprennent des fonctions différentes.
+Le serveur joue avec l'acteur initial et affiche les transitions. Les poids ne
+sont pas encore entraînés. Les tests de l'ancienne interface ont été retirés.
+Les contrôles des réseaux et distributions seront reconstruits autour du
+contrat actuel, au fil des prochaines étapes.
 
-| Élément | Fonction | Sortie actuelle | Utilisation prévue |
-| --- | --- | --- | --- |
-| Acteur, `PPOActorNetwork` | Décrire comment choisir une action selon l'observation | Trois moyennes et trois log-écarts-types | Exécution du joueur dans Unity, apprentissage dans Python |
-| Politique, $\pi_\theta$ | Définir la distribution des actions | Distribution construite avec les sorties de l'acteur et leurs transformations | Échantillonnage des décisions et calcul de leur log-probabilité |
-| Critique, `PPOValueNetwork` | Estimer le retour futur attendu depuis une observation | Une valeur réelle $V_\phi(s)$ | Calcul des avantages et apprentissage de la valeur dans Python |
+### Lancer cet acteur
 
-L'acteur et la politique ne sont pas deux réseaux supplémentaires à entraîner : l'acteur paramètre la politique. Le critique fournit une estimation utile à l'apprentissage ; ce sont les pertes et les optimiseurs qui modifieront les poids de chacun des deux réseaux.
+```powershell
+python -m football_rl.ppo_unity --batch-size 256 --verbose
+```
 
-La valeur prédite par le critique est l'espérance de la somme des récompenses futures actualisées, sous la politique suivie :
+Cette commande fournit `ppo_unity.build_policy` au collecteur commun. La forme
+équivalente, avec choix explicite de la fabrique, est :
+
+```powershell
+python -m football_rl.unity --policy-factory football_rl.ppo_unity:build_policy --verbose
+```
+
+Le lancement générique sans fabrique utilise une politique linéaire de démonstration.
+Les fichiers propres à cet algorithme restent sur la branche `ppo` :
+`ppo_network.py`, `ppo_export.py`, `ppo_unity.py` et ce document.
+
+## 2. Acteur, politique et critique
+
+L'acteur produit les paramètres de la distribution des actions. La politique
+complète comprend ce réseau et son décodage : quatre normales et trois
+Bernoulli indépendantes conditionnellement à l'observation.
+
+Le critique estime le retour actualisé attendu sous la politique suivie :
 
 $$
 V^\pi(s_t)=\mathbb E_\pi\left[\sum_{k=0}^{T-t-1}\gamma^k r_{t+k}\mid s_t\right].
 $$
 
-$s_t$ désigne ici l'observation, $r_t$ la récompense de la transition et $\gamma$ l'importance accordée au futur. Cette valeur peut être négative ou dépasser 1. Elle n'est pas une probabilité de victoire. La fonction de valeur sert de référence pour estimer si une action a conduit à un résultat meilleur ou moins bon que prévu. [Principe des méthodes de gradient de politique avec critique](https://spinningup.openai.com/en/latest/algorithms/vpg.html)
+Ici `s` représente le vecteur d'observation. La valeur peut être négative ou
+supérieure à un. Elle fournit une référence pour estimer si une action a donné
+un résultat meilleur ou moins bon que prévu.
 
-## 2. Boucle Unity / Python prévue
+Les pertes et les optimiseurs mettront à jour les réseaux. Le critique reste
+dans Python ; l'acteur et son décodeur sont exécutés dans Unity.
 
-1. Python prépare une version de l'acteur et l'envoie à Unity dans un format d'export restant à choisir.
-2. Unity construit les observations, exécute cet acteur et échantillonne les commandes.
-3. Unity applique les commandes, simule le match et enregistre les transitions dans leur ordre temporel.
-4. Unity transmet un lot de trajectoires à Python.
-5. Python utilise le critique et les récompenses pour construire les avantages et les cibles de valeur.
-6. PPO met à jour l'acteur ; une perte de valeur entraîne le critique.
-7. Python renvoie une nouvelle version de l'acteur, puis une nouvelle collecte commence.
+## 3. Observations et tenseurs
 
-```mermaid
-flowchart TD
-    S["Unity : état du match"] --> O["Observation normalisée"]
-    O --> A["Acteur exporté et échantillonnage"]
-    A --> C["Commandes du joueur"]
-    C --> U["Simulation Unity"]
-    U --> S
-    U --> B["Transitions envoyées par lots"]
-    B --> V["Python : critique, avantages et cibles"]
-    V --> P["Optimisation de l'acteur et du critique"]
-    P --> E["Nouvelle version de l'acteur"]
-    E --> A
+Les réseaux prennent des tenseurs `float32` de forme `(B, D)` :
+
+- `B` : nombre d'observations, y compris `B=1` pour une situation ;
+- `D` : `obs_size` reçu dans `hello`, avec l'ordre donné par `obs_names`.
+
+La scène examinée utilise 46 valeurs. La formule Unity est
+`28 + 6 * (max_teammates + max_opponents)`. Unity fournit les observations dans
+le repère d'équipe et les met à l'échelle. L'ancien prototype Gymnasium a été
+supprimé ; la dimension d'entrée vient directement du pont.
+
+Une normalisation supplémentaire éventuelle devrait être identique dans
+Python et dans l'export ; elle n'est pas appliquée actuellement.
+
+## 4. Acteur actuel
+
+Le MLP complet est stocké dans `actor.network` :
+
+```text
+(B, D) → Linear(D, 128) → Tanh → Linear(128, 128) → Tanh → Linear(128, 7)
 ```
 
-La collecte utilisera une version fixe de la politique pendant chaque lot. Elle peut contenir plusieurs parties ou des segments de trajectoires ; il n'est pas nécessaire d'attendre un très grand nombre de matchs complets. La taille du lot reste à choisir.
+La dernière couche est linéaire. Ses colonnes suivent cet ordre :
 
-Le critique peut rester dans Python : les valeurs nécessaires seront calculées avec ses poids gelés avant les mises à jour du lot. L'exécution des commandes dans Unity nécessite l'acteur et ses règles d'échantillonnage. Le pont, la sérialisation et l'export ne sont pas encore implémentés.
+| Indice | Commande | Paramètre produit |
+| ---: | --- | --- |
+| 0 | `move_x` | Moyenne gaussienne |
+| 1 | `move_z` | Moyenne gaussienne |
+| 2 | `shoot` | Logit de Bernoulli |
+| 3 | `shoot_power` | Moyenne gaussienne |
+| 4 | `shoot_curve` | Moyenne gaussienne |
+| 5 | `tackle` | Logit de Bernoulli |
+| 6 | `jump` | Logit de Bernoulli |
 
-Exporter le MLP seul ne suffit pas à reproduire la politique : Unity devra aussi reproduire l'ordre des observations, la normalisation, les bornes des log-écarts-types, le tirage gaussien et `tanh`. Pendant la collecte PPO, utiliser seulement les moyennes produirait un comportement différent de celui dont Python calcule les log-probabilités.
+`actor.log_std` est un `nn.Parameter` de forme `(4,)`, indépendant de
+l'observation, initialisé à `log(0.5)`. Il contient les log-écarts-types des
+colonnes continues `[0, 1, 3, 4]`. Le code les borne dans `[-5, 2]` avant usage.
 
-## 3. Des observations réelles aux entrées des réseaux
+`forward` calcule les paramètres, sans tirer d'action :
 
-La taille d'entrée est définie par `ObservationLayout` dans [types.py](src/football_rl/types.py) :
-
-$$
-D=22+7(N_{\text{coéquipiers max}}+N_{\text{adversaires max}}).
-$$
-
-Pour une capacité allant jusqu'au 3v3, deux coéquipiers et trois adversaires donnent $D=57$. Cette capacité reste fixe pendant les phases 1v1 et en équipe.
-
-| Indices, à partir de zéro, pour cette capacité | Contenu | Nombre de valeurs |
-| --- | --- | ---: |
-| 0 à 5 | Position relative du ballon, puis vélocité 3D | 6 |
-| 6 à 8 | Vélocité 3D du joueur contrôlé | 3 |
-| 9 à 22 | Deux emplacements de coéquipiers | 14 |
-| 23 à 43 | Trois emplacements d'adversaires | 21 |
-| 44 à 48 | Centre relatif, largeur et hauteur du but adverse | 5 |
-| 49 à 53 | Centre relatif, largeur et hauteur du but défendu | 5 |
-| 54 à 56 | Temps et deux scores | 3 |
-
-Chaque emplacement de joueur contient sa position relative (3), sa vitesse (3) et sa présence (1). Les valeurs d'un joueur absent sont nulles. Le MLP devra apprendre à exploiter la présence ; `nn.Linear` n'applique pas automatiquement un masque particulier.
-
-Le repère est centré sur le joueur, avec des axes parallèles à ceux du terrain et un axe vertical $y$. Les observations sont normalisées dans des bornes partagées avec Unity. Le module `ppo_network.py` reçoit le vecteur déjà préparé ; il ne réalise pas cette préparation.
-
-### Exemple d'encodage
-
-Les positions et échelles de cet exemple sont illustratives, sans imposer de réglages au jeu.
-
-- Joueur : position $(10,0,5)$, vitesse $(0,0,2)$.
-- Ballon : position $(14,1,11)$, vitesse $(-1,0,-2)$.
-- Échelle choisie pour l'exemple : 20 unités pour les positions relatives et 10 pour les vitesses.
-
-La position relative du ballon vaut $(4,1,6)$. Le début du vecteur devient :
-
-| Bloc | Valeurs normalisées de l'exemple |
-| --- | --- |
-| Position relative du ballon | $(0{,}20,0{,}05,0{,}30)$ |
-| Vitesse du ballon | $(-0{,}10,0,-0{,}20)$ |
-| Vitesse du joueur | $(0,0,0{,}20)$ |
-
-Les blocs des autres joueurs, des buts et du match complètent ensuite les 57 valeurs. Les dimensions intérieures des buts indiquent l'ouverture à atteindre ; elles ne déclenchent pas un calcul automatique de visée. Leur utilité sera apprise à partir des expériences.
-
-Les réseaux prennent un lot de forme $(B,D)$ : $B=1$ pour une observation, $B=8$ pour huit situations. Les lignes sont traitées avec les mêmes poids. Les données produites par `torch.randn` dans la démonstration servent à vérifier les calculs ; elles ne représentent pas des matchs cohérents.
-
-## 4. Fonctionnement du code déjà écrit
-
-### Critique
-
-`PPOValueNetwork` applique deux couches de 128 neurones avec activations `Tanh`, puis une couche linéaire à une sortie :
-
-$$
-(B,D)\rightarrow(B,128)\rightarrow(B,128)\rightarrow(B,1)\rightarrow(B).
-$$
-
-La dernière transformation est `squeeze(-1)`, qui préserve la dimension du lot même quand $B=1$. Le résultat est accessible sous la clé `value`. Les poids de ce réseau sont distincts de ceux de l'acteur.
-
-### Acteur de déplacement
-
-`PPOActorNetwork` possède un tronc de deux couches de 128 neurones avec `Tanh`, suivi de deux têtes linéaires. `forward` retourne :
-
-| Clé | Forme | Signification |
+| Clé | Forme | Contenu |
 | --- | --- | --- |
-| `mean` | $(B,3)$ | Moyennes $\mu$ des coordonnées avant transformation |
-| `log_std` | $(B,3)$ | Logarithmes des écarts-types |
+| `model_output` | `(B, 7)` | Sortie brute du MLP dans l'ordre Unity |
+| `continuous_mean` | `(B, 4)` | Moyennes des commandes continues |
+| `continuous_log_std` | `(B, 4)` | Paramètres bornés et étendus sur le lot |
+| `binary_logits` | `(B, 3)` | Logits de `shoot`, `tackle`, `jump` |
 
-`sample_move` borne les log-écarts-types entre -5 et 2, puis calcule $\sigma=\exp(\log\sigma)$. Les bornes constituent un choix initial de stabilité numérique, à conserver identique dans tous les chemins d'exécution. Il échantillonne ensuite :
+Moyennes et logits dépendent de l'observation. Les écarts-types sont partagés
+entre observations, mais appris pendant l'entraînement. L'optimiseur devra
+recevoir `actor.parameters()` pour inclure ces paramètres externes au MLP.
 
-$$
-u_i\sim\mathcal N(\mu_i,\sigma_i^2),\qquad a_i=\tanh(u_i).
-$$
+### Exemple de lecture
 
-`Normal` attend l'écart-type comme paramètre `scale`. `sample()` produit un échantillon sans chemin de gradient à travers le tirage. La future mise à jour PPO recalculera la log-probabilité de cette action maintenue fixe. [Distributions PyTorch](https://docs.pytorch.org/docs/2.14/distributions.html)
+Pour une sortie `[0.8, -0.2, 1.1, -0.6, 0, -2, -3]`, les moyennes continues
+sont `[0.8, -0.2, -0.6, 0]` et les logits binaires `[1.1, -2, -3]`.
+La probabilité de frappe vaut `sigmoid(1.1)`, environ 75 %. La puissance brute
+est centrée sur −0,6 ; si cette valeur est tirée et la frappe déclenchée, Unity
+utilise une intensité de 0,2 via `clip((a + 1) / 2, 0, 1)`.
 
-Les trois coordonnées sont indépendantes conditionnellement à l'observation. Une même observation produit les mêmes paramètres avec les mêmes poids, mais peut donner plusieurs échantillons. Un écart-type plus grand disperse les valeurs brutes ; après `tanh`, des valeurs extrêmes se concentrent près des bornes. La moyenne avant `tanh` n'est pas nécessairement la moyenne des actions finales.
+## 5. Critique actuel
 
-### Exemple d'action et interprétation Unity
+Le critique possède ses propres poids :
 
-Un déplacement brut d'environ $(0{,}31,0,0{,}55)$ donne une cible normalisée proche de $(0{,}30,0,0{,}50)$.
+```text
+(B, D) → Linear(D, 128) → Tanh → Linear(128, 128) → Tanh → Linear(128, 1)
+```
 
-Avec une échelle d'action illustrative de 10 unités, Unity convertirait cette cible en un décalage $(3,0,5)$. Depuis le joueur en $(10,0,5)$, cela donnerait une cible en $(13,0,10)$, proche du ballon de l'exemple.
+`squeeze(-1)` transforme `(B, 1)` en `(B,)` sans supprimer l'axe du lot quand
+`B=1`. La valeur est accessible sous la clé `value`.
 
-Le contrôleur Unity ferait avancer le joueur vers cette cible selon les règles du jeu, sa vitesse et ses collisions. Il ne s'agit pas d'une téléportation. L'échelle et la règle de déplacement effectives restent à convenir.
+## 6. Échantillonnage et log-probabilités à implémenter
 
-| Commande du contrat complet | Sens | État de l'acteur actuel |
-| --- | --- | --- |
-| `move_target` | Cible relative normalisée, trois coordonnées | Implémentée |
-| `shoot` | Intensité unique entre 0 et 1 pour tirer ou passer ; zéro pour attendre | À construire |
-| `jump` | Demande de saut, zéro ou un | Prochaine étape |
-| `tackle` | Demande de tacle optionnel | À construire si activé |
-
-Les commandes pourront être simultanées selon les règles Unity. La direction de frappe dépendra du placement. L'intensité ne comportera aucun seuil distinguant automatiquement une passe d'un tir. `sample_move` ne produit donc pas encore une `FootballAction` complète.
-
-### Log-probabilité du déplacement
-
-Le nom `log_prob` désigne ici une log-densité continue, qui peut être positive. Elle décrit la densité attribuée à une action, pas la qualité de cette action.
-
-Le changement de variable $a=\tanh(u)$ impose :
+Unity utilise déjà :
 
 $$
-\log\pi(a\mid s)=\sum_{i=1}^{3}\left[\log p(u_i\mid s)-\log(1-\tanh^2(u_i))\right].
+a_i\sim\mathcal N(\mu_i(s),\sigma_i^2),\quad
+\sigma_i=\exp(\operatorname{clamp}(\ell_i,-5,2)),\quad i\in\{0,1,3,4\},
 $$
 
-Le code calcule la gaussienne sur `raw_move`, puis utilise l'identité stable :
-
 $$
-\log(1-\tanh^2(u))=2\left(\log 2-u-\operatorname{softplus}(-2u)\right).
-$$
-
-Cette écriture évite le logarithme d'une différence arrondie à zéro près de la saturation. `softplus` provient de `torch.nn.functional`. [Fonction softplus](https://docs.pytorch.org/docs/2.14/generated/torch.nn.functional.softplus.html)
-
-`sample_move` retourne `raw_move` et `move_target` de forme $(B,3)$, ainsi que `log_prob` de forme $(B,)$. La somme porte sur les coordonnées, pas sur le lot.
-
-`evaluate_move` reçoit des observations et des déplacements bruts enregistrés. Il recalcule leur log-densité avec les poids actuels, sans nouveau tirage et sans calcul d'entropie. Les actions doivent rester détachées du graphe de collecte, tandis que la nouvelle log-probabilité doit rester reliée aux poids à entraîner.
-
-## 5. PPO-Clip : objectif et calculs à implémenter
-
-PPO est **model-free** : il n'apprend pas un modèle des transitions physiques. Il est **on-policy** : chaque phase d'amélioration repose sur une collecte récente sous une politique connue. C'est une méthode de **gradient de politique** : elle ajuste directement les paramètres de la distribution des actions. Notre version sera **actor-critic**, avec une politique explicite et une estimation de valeur.
-
-L'objectif de base est de maximiser le retour attendu :
-
-$$
-J(\theta)=\mathbb E_{\pi_\theta}\left[\sum_t\gamma^t r_t\right].
+a_j\sim\operatorname{Bernoulli}(\operatorname{sigmoid}(z_j(s))),
+\quad j\in\{2,5,6\}.
 $$
 
-Les récompenses viendront des événements et règles du projet. Leurs coefficients ne sont pas fixés par ce document. PPO permet plusieurs passages sur un même lot récent avant une nouvelle collecte. [Publication PPO](https://arxiv.org/abs/1707.06347)
+Contrats proposés pour Python :
 
-### Avantage et GAE (Generalized Advantage Estimation)
+- `sample_action(observations)` retourne `actions` de forme `(B, 7)` et
+  `log_prob` de forme `(B,)` après un seul passage dans le MLP ;
+- `evaluate_action(observations, actions)` réévalue les actions enregistrées
+  sous les paramètres actuels, sans nouveau tirage.
 
-L'avantage estime si une action a produit un résultat meilleur ou moins bon que prévu. Un avantage positif favorise sa probabilité ; un avantage négatif encourage à la réduire. Une récompense immédiate positive peut néanmoins correspondre à un avantage négatif si la suite est décevante.
+La log-probabilité totale additionne les sept contributions :
 
-Avec les valeurs calculées avant les mises à jour, on construira :
+$$
+\log\pi(a\mid s)=\sum_{i\in\{0,1,3,4\}}\log\mathcal N(a_i;\mu_i(s),\sigma_i^2)
++\sum_{j\in\{2,5,6\}}\log\operatorname{Bernoulli}(a_j;p_j(s)).
+$$
+
+La somme porte sur les commandes et conserve une valeur par observation.
+Les commandes continues restent brutes : le moteur borne les valeurs lors de
+leur application physique. Aucune transformation `tanh` de l'action ni
+correction de Jacobien n'est utilisée. Les activations `Tanh` internes au MLP
+restent en place.
+
+Puissance et effet contribuent à la log-probabilité même lorsque `shoot=0`.
+Unity les échantillonne dans tous les cas. Une commande ignorée par les règles
+du jeu reste également présente dans l'action enregistrée.
+
+Unity applique un plancher de `1e-8` à la probabilité binaire sélectionnée avant
+son logarithme. La comparaison avec Python devra couvrir les logits extrêmes
+et les différences d'arrondi entre les deux implémentations.
+
+Les actions, anciennes log-probabilités et anciennes valeurs du buffer doivent
+être détachées du graphe PyTorch. La nouvelle évaluation des log-probabilités
+doit rester différentiable par rapport à l'acteur.
+
+## 7. Export et cycle de collecte
+
+`export_actor` copie l'acteur, prépare sa copie CPU `float32` et exporte le MLP
+complet avec `iafoot.models.from_torch`. Le contrôle `check=True` joint une
+entrée et la sortie PyTorch attendue pour que Unity vérifie son calcul.
+
+Les log-écarts-types bornés de la même copie sont envoyés au décodeur :
+
+```text
+[log_std_move_x, log_std_move_z, 0, log_std_power, log_std_curve, 0, 0]
+```
+
+Les positions binaires sont ignorées. `deterministic=False` conserve
+l'exploration. `ModelExport` et `DecoderExport` sont envoyés ensemble par
+`UnityConnection.send_model`, avec une version commune.
+
+Le cycle d'apprentissage futur sera :
+
+1. Publier la politique `v` et traiter son accusé de réception.
+2. Accumuler suffisamment de transitions de cette version.
+3. Calculer valeurs, avantages et cibles avec les paramètres de référence.
+4. Effectuer plusieurs mises à jour PPO sur ce lot récent.
+5. Publier `v+1` et préparer une nouvelle collecte.
+
+Unity continue à simuler pendant les mises à jour Python. Les tags
+`model_version` permettent de traiter les lots en attente et les changements
+au milieu d'un épisode. Avant toute optimisation, réévaluer avec la politique
+exportée doit donner `exp(log_prob_python - log_prob_unity)` proche de 1 pour
+les mêmes observations et actions.
+
+## 8. PPO-Clip : principe
+
+PPO est model-free : il n'apprend pas le moteur physique. C'est une méthode
+on-policy de gradient de politique, utilisée ici avec un critique. Elle
+réutilise un lot récent pendant plusieurs passages, puis collecte de nouvelles
+données. Le ratio entre politiques n'autorise pas un replay arbitraire de
+vieilles expériences. [PPO-Clip, OpenAI Spinning Up](https://spinningup.openai.com/en/latest/algorithms/ppo.html)
+
+Pour une transition, comparer la politique actuelle à celle qui a joué :
+
+$$
+\rho_t=\exp(\log\pi_\theta(a_t\mid s_t)-\log\pi_{\mathrm{old}}(a_t\mid s_t)).
+$$
+
+L'objectif de l'acteur est :
+
+$$
+L^{\mathrm{clip}}=\mathbb E_t\left[\min\left(\rho_t\hat A_t,
+\operatorname{clip}(\rho_t,1-\epsilon,1+\epsilon)\hat A_t\right)\right].
+$$
+
+Un avantage positif favorise l'action ; un avantage négatif pousse à réduire
+sa probabilité. Le clipping limite l'incitation à changer cette probabilité
+dans la direction favorisée. Il ne borne pas directement les poids et ne
+garantit pas une amélioration.
+
+La perte acteur à minimiser sera `-L_clip`, avec éventuellement un bonus
+d'entropie. La perte du critique sera une erreur quadratique entre sa prédiction
+et la cible de retour. Les réseaux pourront avoir des optimiseurs séparés.
+
+## 9. Buffer, avantages et fins de trajectoire
+
+Le futur buffer utilisera les champs de `iafoot.Batch`, notamment actions
+brutes, récompenses, observations suivantes, anciennes log-probabilités,
+versions et identifiants temporels. Il faut reconstruire les segments avant de
+mélanger les transitions pour l'optimisation.
+
+GAE utilise les valeurs du critique avant mise à jour :
 
 $$
 \delta_t=r_t+\gamma b_tV_{\mathrm{old}}(s_{t+1})-V_{\mathrm{old}}(s_t),
-$$
-
-$$
+\qquad
 \hat A_t=\delta_t+\gamma\lambda c_t\hat A_{t+1}.
 $$
 
-La récurrence GAE se calcule à rebours. $\lambda$ règle la profondeur de combinaison des erreurs et le compromis entre biais et variance. $b_t$ autorise une estimation de valeur future ; $c_t$ autorise la continuation de la récursion dans la trajectoire. La cible de valeur proposée est $\hat R_t=\hat A_t+V_{\mathrm{old}}(s_t)$, calculée avant de normaliser éventuellement les avantages destinés à l'acteur. [Publication GAE](https://arxiv.org/abs/1506.02438)
+La récurrence se calcule à rebours. `b_t` autorise le bootstrap de valeur ;
+`c_t` autorise la propagation depuis la transition suivante du même segment.
+La combinaison des erreurs temporelles règle le compromis entre biais et
+variance. [Publication GAE](https://arxiv.org/abs/1506.02438)
 
-| Situation | $b_t$ | $c_t$ |
+| Situation dans notre tâche | `b_t` | `c_t` |
 | --- | ---: | ---: |
-| Transition ordinaire avec une suite dans le segment | 1 | 1 |
-| Véritable fin de match | 0 | 0 |
-| Coupure technique avec reset | 1 | 0 |
-| Fin du segment disponible, match encore en cours | 1 | 0 |
+| Transition ordinaire avec la suite disponible | 1 | 1 |
+| But : `terminated=True` | 0 | 0 |
+| Coupure technique : `truncated=True` | 1 | 0 |
+| Fin de segment non terminal, trou de pas ou frontière de version | 1 | 0 |
 
-Lors d'une coupure technique, la valeur future utilise l'observation finale avant le reset. La récursion ne traverse jamais la frontière vers un nouveau match. La fin normale du chrono peut constituer une terminaison du problème ; `max_steps` utilisé uniquement pour couper la collecte est une troncature. [Terminaisons et limites de temps](https://gymnasium.farama.org/tutorials/gymnasium_basics/handling_time_limits/)
+Le bootstrap d'une troncature utilise `next_obs` avant reset. La récurrence ne
+traverse pas le reset. Cette distinction suit le traitement des
+[terminaisons et limites de temps](https://gymnasium.farama.org/tutorials/gymnasium_basics/handling_time_limits/).
+Dans notre tâche, un but termine l'épisode ; une fin de match signalée comme
+troncature par le pont conserve cette convention.
 
-### Ratio, clipping et pertes
+La cible du critique sera `returns = advantages + old_values`, calculée avant
+la normalisation éventuelle des avantages pour l'acteur. Ces cibles et les
+anciennes log-probabilités restent fixes pendant les passages sur le lot.
 
-Pour une action enregistrée, PPO compare la nouvelle politique à celle qui a joué :
+## 10. Prochain exercice
 
-$$
-\rho_t=\exp\left(\log\pi_\theta(a_t\mid s_t)-\log\pi_{\mathrm{old}}(a_t\mid s_t)\right).
-$$
-
-Le terme à maximiser est :
-
-$$
-L^{\mathrm{clip}}=\mathbb E_t\left[\min\left(\rho_t\hat A_t,\operatorname{clip}(\rho_t,1-\epsilon,1+\epsilon)\hat A_t\right)\right].
-$$
-
-Le clipping retire l'incitation à augmenter trop fortement la probabilité d'une bonne action ou à diminuer trop fortement celle d'une mauvaise action. Il ne borne pas directement les changements de poids et ne garantit pas une amélioration. Une surveillance de la divergence KL pourra interrompre les mises à jour du lot.
-
-L'acteur minimisera $-L^{\mathrm{clip}}$, avec éventuellement un bonus d'entropie. Le critique minimisera une erreur quadratique $\mathbb E[(V_\phi(s_t)-\hat R_t)^2]$. Les réseaux séparés pourront utiliser deux optimiseurs. [Équations et explication de PPO-Clip](https://spinningup.openai.com/en/latest/algorithms/ppo.html)
-
-Exemple numérique : si les log-densités d'un déplacement passent de -2 à -1,8, le ratio vaut environ 1,22. Avec un avantage de 0,4 et un $\epsilon$ illustratif de 0,2, le terme non clippé vaut environ 0,488, le terme clippé 0,48. Le minimum conserve 0,48. Une log-probabilité croissante ne signifie donc pas, seule, que l'action est bonne : l'avantage fournit ce signal.
-
-Les anciennes log-probabilités, les anciennes valeurs, les avantages et les cibles restent fixes pendant les passages sur le lot. L'ordre temporel sert à calculer GAE avant de mélanger les transitions en mini-lots. Le nombre de passages, la taille du lot, $\gamma$, $\lambda$, $\epsilon$ et les taux d'apprentissage restent à choisir ; aucun n'est encore implémenté dans une boucle PPO.
-
-## 6. Données à convenir avec l'équipe Unity
-
-`Transition` contient déjà observation, action, récompense, observation suivante, `terminated` et `truncated`. Pour PPO, il faudra compléter la collecte ou conserver des métadonnées associées :
-
-| Donnée | Utilité |
-| --- | --- |
-| Version de politique | Identifier les poids qui ont produit le lot |
-| Identité du joueur, du match et ordre des décisions | Reconstituer les trajectoires sans mélanger les agents |
-| `raw_move` | Réévaluer le déplacement malgré la saturation de `tanh` |
-| Ancienne log-probabilité | Former le ratio PPO |
-| Observation finale avant reset | Calculer la valeur future lors d'une troncature |
-| Convention de normalisation et cadence des décisions | Reproduire les mêmes entrées et la même notion de pas temporel |
-
-Les métadonnées propres à PPO ne sont pas encore définies dans `Transition`. Son champ `next_observation` pourra contenir l'observation finale avant reset ; cette convention devra être respectée par le pont. Les anciennes log-probabilités peuvent être transmises par Unity ou recalculées en Python avec une copie gelée de l'acteur, si les données permettent de reproduire exactement sa distribution. Les valeurs du critique peuvent être calculées en Python avant l'optimisation du lot.
-
-Le buffer conservera les actions, anciennes log-probabilités et valeurs sans graphe Autograd. `sample()` ne détache pas automatiquement toutes les autres sorties de la méthode : `log_prob` reste différentiable si Autograd est actif. La collecte utilisera donc `torch.no_grad()` ou un détachement explicite ; l'évaluation pendant l'apprentissage activera les gradients vers les poids courants.
-
-Lorsque toutes les commandes seront disponibles, PPO utilisera la log-probabilité de l'action complète. Avec une factorisation conditionnelle, elle sera la somme des contributions du déplacement, de la frappe et des commandes binaires. Le `log_prob` actuel ne couvre que le déplacement.
-
-Les actions enregistrées doivent correspondre aux commandes soumises à Unity. Les règles de contact, de saut et de frappe peuvent limiter leur effet physique ; une correction ou transformation supplémentaire des commandes doit être définie de façon cohérente dans la chaîne.
-
-## 7. Vérifications disponibles et limites
-
-Dans l'environnement Python du projet, lancer depuis la racine :
-
-```powershell
-python -m football_rl.ppo_network
-```
-
-Le bloc de démonstration vérifie les formes des log-probabilités pour un lot de huit et un lot de un, la finitude sur le lot de huit, la proximité entre échantillonnage et réévaluation, une valeur de référence et la présence de gradients dans les deux têtes. Les résultats aléatoires changent d'une exécution à l'autre. `allclose` compare avec une tolérance.
-
-Le cas de référence est une gaussienne standard sur trois coordonnées, évaluée en $(0,0,0)$. La correction est nulle et la log-densité vaut $-\frac32\log(2\pi)\approx-2{,}7568$.
-
-La perte négative moyenne utilisée dans la démonstration sert uniquement à examiner les gradients. `backward()` les calcule sans mettre à jour les poids. Le bloc ne réalise ni optimisation PPO, ni mesure d'une stratégie de football.
-
-`Football3DEnv` contient actuellement un fonctionnement factice : observations aléatoires, actions sans effet et récompenses nulles. Il permet des vérifications d'interface ; les performances d'apprentissage devront être évaluées sur une tâche où les actions ont des conséquences, puis dans Unity.
-
-## 8. Prochaine étape et travail restant
-
-La prochaine étape pédagogique est la tête de saut : un logit issu du tronc de l'acteur, une distribution de Bernoulli, puis des méthodes d'échantillonnage et de réévaluation. Aucun code de saut n'est ajouté à ce stade.
-
-La suite prévue est :
-
-1. Ajouter `jump`, puis `shoot` avec la possibilité explicite de produire zéro, et le tacle si retenu.
-2. Assembler la distribution et la log-probabilité de l'action complète.
-3. Construire le buffer de collecte, GAE et les cibles du critique.
-4. Implémenter les pertes, les optimiseurs et les mini-lots PPO.
-5. Suivre les récompenses, résultats de match, pertes, entropie et divergence KL dans TensorBoard.
-6. Compléter le contrat de collecte, l'export et l'exécution dans Unity.
-
-Le choix d'une distribution d'intensité doit traiter l'absence de frappe : une distribution continue ordinaire ne produit presque jamais exactement zéro. La politique gardera néanmoins une seule commande externe `shoot` pour tirer et passer.
-
-L'entraînement initial pourra utiliser un adversaire fixe pour distinguer les problèmes de PPO de ceux liés à des adversaires qui apprennent simultanément. Les résultats seront ensuite évalués sur plusieurs matchs et plusieurs initialisations, avec les mêmes règles de jeu et d'observation.
+Écrire `sample_action`, puis `evaluate_action`, selon la section 6. Les futurs
+contrôles porteront sur `B=1` et `B=8`, la somme des sept log-probabilités, les
+gradients des sorties et des quatre `log_std`, puis la cohérence Python/Unity.
+Le buffer et les pertes viendront ensuite.
