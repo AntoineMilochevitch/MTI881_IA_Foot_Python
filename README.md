@@ -1,144 +1,191 @@
-# Football 3D — Reinforcement Learning Backend
+# Football 3D — backend Python
 
-Backend Python pour comparer plusieurs algorithmes d'apprentissage par renforcement avec PyTorch dans un jeu de football 3D sous Unity, avec des cages en hauteur.
+Backend PyTorch pour comparer des algorithmes de RL dans un jeu de football Unity,
+d'abord en 1v1, puis en équipe. Unity simule les matchs, exécute la politique et
+calcule les récompenses. Python exporte les modèles et reçoit les transitions.
 
-L'apprentissage commence en **1v1**, puis évolue vers le jeu en équipe afin d'étudier les comportements coopératifs.
+## État actuel
 
-Le projet commence en **1v1** et est structuré pour évoluer vers des équipes et du multi-agents.
+| Élément | État |
+| --- | --- |
+| Accès au paquet `iafoot` du dépôt Unity | Script de liaison pour chaque environnement virtuel |
+| Envoi d'une politique et réception des lots | Disponible avec `python -m football_rl.unity` |
+| Export | Modèles et décodeurs fournis par `iafoot.models` |
+| Algorithmes, buffers, pertes, optimiseurs et checkpoints | Développés dans les branches dédiées |
+| TensorBoard | Dépendance installée ; métriques à brancher |
 
-La [documentation PPO](README_PPO.md) explique les réseaux déjà construits, leur rôle dans Unity, les calculs d'apprentissage et les prochaines étapes.
+La commande de collecte utilise par défaut une politique linéaire de démonstration.
+Une fabrique configurable permet d'envoyer le modèle d'un algorithme. Les lots
+sont affichés puis libérés, sans apprentissage ni sauvegarde des transitions.
 
-## Architecture
-
-```text
-.
-├── pyproject.toml
-├── requirements.txt
-├── README.md
-├── README_PPO.md
-└── src/
-    └── football_rl/
-        ├── __init__.py
-        ├── agent.py          # Apprentissage sur un lot et export du modèle
-        ├── communication.py  # Réception des épisodes et envoi du réseau à Unity
-        ├── env.py            # Interface Gymnasium, raccordement à définir
-        ├── network.py        # Base PyTorch commune aux futurs réseaux
-        ├── ppo_network.py    # Critique et politique de déplacement PPO
-        ├── rewards.py        # Composantes et coefficients à déterminer
-        ├── train.py          # Contrat d'orchestration et configuration
-        └── types.py          # Observations, actions, épisodes, lots et modèle
-```
-
-Unity assure la simulation et l'exécution du modèle pendant les parties. Python reçoit les expériences, effectue la rétropropagation avec PyTorch et prépare le réseau mis à jour pour Unity. L'architecture ne fixe aucun algorithme particulier.
+- [Installation et utilisation du pont](README_UNITY.md)
 
 ## Installation
 
-Prérequis : Python 3.12 ou plus récent et pip.
+Prérequis : Python 3.12 ou plus récent et les deux dépôts côte à côte :
+
+```text
+MTI881_IA_Foot/
+├── MTI881_IA_Foot_Python/
+└── MTI881_IA_Foot_Unity/
+    └── python/iafoot/
+```
+
+Si le dépôt parent vient d'être cloné, exécuter depuis celui-ci :
+
+```powershell
+git submodule update --init --recursive
+```
+
+Puis, **depuis `MTI881_IA_Foot_Python`** :
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -e .
+python scripts/link_unity_bridge.py
 ```
 
-Sous macOS/Linux, activer l'environnement avec :
+Pour un environnement existant, conserver `.venv` et exécuter les deux dernières
+commandes avec son interpréteur. Sous Linux/macOS, l'activation est
+`source .venv/bin/activate`.
 
-```bash
-source .venv/bin/activate
-```
+Le script enregistre le chemin du paquet Unity dans un fichier `.pth` de cet
+environnement. Le relancer après un déplacement des dépôts ou une recréation de
+`.venv`. Chaque collègue configure son propre environnement ; aucun chemin
+propre à une machine n'est versionné.
 
-Les dépendances incluent Gymnasium, NumPy, PyTorch et TensorBoard. Après activation de l'environnement, lancer TensorBoard avec :
+Pour un autre emplacement :
 
 ```powershell
-tensorboard --logdir runs
+python scripts/link_unity_bridge.py --unity-python "D:\projets\MTI881_IA_Foot_Unity\python"
 ```
 
-L'interface est accessible à l'adresse `http://localhost:6006`. 
+## Lancer la collecte
 
-## Communication Unity ↔ Python
+Depuis le dépôt Python, avec `.venv` activé :
 
-L'entraînement suit la boucle suivante :
-
-1. Unity exécute le modèle et enregistre des parties.
-2. Unity transmet les épisodes par lots au backend Python.
-3. Python entraîne le réseau avec PyTorch et met à jour ses poids.
-4. Python renvoie le réseau à Unity, qui le charge sur les agents.
-5. La collecte reprend jusqu'à convergence ou interruption de l'entraînement.
-
-```text
-Unity : modèle en jeu → collecte d'épisodes
-                  │
-                  └── lot d'épisodes → Python : entraînement PyTorch
-                                               │
-Unity : chargement du réseau mis à jour ←───────┘
+```powershell
+python -m football_rl.unity --batch-size 256 --verbose
 ```
 
-`UnityTrainingBridge` décrit la réception d'un `EpisodeBatch` et l'envoi d'un `ModelArtifact`. Les types Python représentent les échanges attendus ; leur sérialisation, le protocole de communication et le format du réseau exporté restent à choisir selon les contraintes de performance et de simplicité. Cette organisation s'inspire de ML-Agents sans imposer son utilisation.
+La commande installée `football-rl-unity` propose les mêmes options. Le serveur
+écoute sur `127.0.0.1:5005` et cible le comportement `Foot` par défaut.
 
-`Football3DEnv` fournit le contrat d'une interface compatible Gymnasium. Ses méthodes `reset()` et `step()` proposent actuellement des observations factices, sans effet des actions et avec une récompense nulle. Le raccordement à Unity et son articulation avec la collecte par lots restent à préciser.
+Dans Unity, ouvrir la scène de démonstration, utiliser le menu
+**IA Foot > Entraînement > Préparer la scène (tous les joueurs deviennent des agents)**,
+puis lancer **Play**. Les détails sont dans [README_UNITY.md](README_UNITY.md).
 
-## Observations
+Le serveur récupère la dimension et l'ordre des observations dans `hello`,
+exporte la politique, affiche `model_ack`, puis les formes et versions des lots.
+`Ctrl+C` arrête le serveur. La graine `--seed` contrôle l'initialisation Python ;
+Unity possède son propre générateur pour les tirages d'actions.
 
-L'agent dispose d'une représentation globale normalisée dans **[-1, 1]**, avec un repère centré sur la position de l'agent et des axes parallèles à ceux du terrain (`x`, `y` vertical, `z`). Ce repère ne tourne pas avec l'agent. Les bornes physiques et les détails d'encodage devront être définis avec Unity.
+## Observations envoyées par Unity
 
-Pour conserver le même réseau entre le 1v1 et les équipes, `ObservationLayout` fixe dès le départ un maximum de coéquipiers et d'adversaires. Chaque emplacement de joueur contient sa position relative 3D, sa vélocité 3D et un masque de présence. Un emplacement absent contient des zéros, avec un masque nul ; le modèle devra exploiter ces masques pour ignorer les joueurs absents.
+L'ordre et la dimension viennent de `hello.behaviors[].obs_names` et `obs_size`.
+Le code source est [FootSpaces.cs](../MTI881_IA_Foot_Unity/Assets/IAFoot/Scripts/Learning/FootSpaces.cs).
 
-La convention Python utilise un vecteur `Box` de type `float32`, dans cet ordre :
-
-| Groupe | Valeurs | Dimensions |
+| Groupe, dans l'ordre du vecteur | Contenu | Taille |
 | --- | --- | ---: |
-| Ballon | Position relative et vélocité 3D | 6 |
-| Agent | Vélocité 3D | 3 |
-| Coéquipiers | Position relative, vélocité 3D et présence par emplacement | 7 × maximum de coéquipiers |
-| Adversaires | Position relative, vélocité 3D et présence par emplacement | 7 × maximum d'adversaires |
-| Buts | Centre relatif (3), largeur (1) et hauteur (1) de chaque ouverture | 10 |
-| Match | Temps et deux scores | 3 |
+| Joueur contrôlé | Position 3D, vitesse 3D, orientation X/Z, charge, deux cooldowns, quatre indicateurs d'état | 15 |
+| Ballon | Position relative 3D, position dans le terrain 3D, vitesse 3D | 9 |
+| Buts | Joueur vers son but en X/Z, ballon vers le but adverse en X/Z | 4 |
+| Coéquipiers | Présence, position relative X/Z, vitesse X/Z, état étourdi | 6 par emplacement |
+| Adversaires | Même encodage que les coéquipiers | 6 par emplacement |
 
-La dimension est **22 + 7 × (maximum de coéquipiers + maximum d'adversaires)**. Les maxima restent identiques entre les phases ; seul le nombre de joueurs présents change. Leurs valeurs restent à définir.
+La dimension vaut **28 + 6 × (maximum de coéquipiers + maximum d'adversaires)**.
+La scène examinée réserve un coéquipier et deux adversaires : **46 valeurs**.
+Avec deux coéquipiers et trois adversaires, elle serait de 58. Les emplacements
+absents sont remplis de zéros. Les capacités restent fixes pour un acteur donné.
 
-Chaque but est décrit par `(centre_x, centre_y, centre_z, largeur, hauteur)`, d'abord le but adverse puis le but défendu. Le centre est celui de l'ouverture rectangulaire ; sa coordonnée verticale indique donc aussi la hauteur à laquelle se trouve le but.
+Le repère dépend de l'équipe : **+X est dirigé vers le but adverse**, Y est
+vertical et Z latéral. Il ne suit pas l'orientation du joueur. Certaines
+positions sont relatives, d'autres absolues dans ce repère. Unity divise les
+positions par `positionScale` et les vitesses par `velocityScale` ; les valeurs
+ne sont pas nécessairement bornées dans `[-1, 1]`. Python reçoit ces données déjà
+préparées. La largeur et la hauteur des buts, le score et le temps de match ne
+figurent pas dans ce vecteur.
 
-Avec 2 emplacements de coéquipiers et 3 d'adversaires (jusqu'au 3v3), l'observation contient **22 + 7 × (2 + 3) = 57 valeurs**, y compris pendant la phase 1v1.
+## Actions appliquées
 
-## Actions
+| Indice | Nom | Sortie du MLP | Utilisation par Unity |
+| ---: | --- | --- | --- |
+| 0 | `move_x` | Moyenne gaussienne | Déplacement longitudinal |
+| 1 | `move_z` | Moyenne gaussienne | Déplacement latéral |
+| 2 | `shoot` | Logit de Bernoulli | Déclenchement de la frappe |
+| 3 | `shoot_power` | Moyenne gaussienne | Intensité : `clip((a + 1) / 2, 0, 1)` |
+| 4 | `shoot_curve` | Moyenne gaussienne | Effet latéral borné dans `[-1, 1]` |
+| 5 | `tackle` | Logit de Bernoulli | Déclenchement du tacle |
+| 6 | `jump` | Logit de Bernoulli | Déclenchement du saut |
 
-Les actions prévues sont le déplacement vers un point, une frappe à intensité variable, le saut et, éventuellement, le tacle. La commande unique `shoot` sert aussi bien à tirer qu'à faire une passe : l'agent apprend à ajuster son placement et l'intensité selon la situation. Aucun seuil d'intensité ne distingue automatiquement une passe d'un tir ; cette distinction dépend des événements de jeu.
+Le décodeur `direct` tire quatre gaussiennes et trois Bernoulli. Les actions
+enregistrées sont les **tirages bruts** : les bornes sont appliquées ensuite par
+le jeu. Le déplacement est une commande de direction/vitesse, avec composantes
+bornées et norme limitée ; l'acteur apprend ainsi à se placer pour frapper.
 
-L'agent doit apprendre à se déplacer pour se placer avant de tirer ou de faire une passe. La direction de frappe découle de son placement dans Unity, sans commande de direction explicite. La règle reliant ce placement à la direction du ballon reste à définir côté moteur.
+Une seule mécanique de frappe sert aux passes et aux tirs. L'agent choisit le
+déclenchement, la puissance et l'effet ; la direction initiale dépend de
+l'orientation du joueur. Une commande peut rester sans effet si les règles du
+jeu l'empêchent, par exemple pendant un cooldown.
 
-Le contrat Python propose le `Dict` suivant. Ce codage est une convention d'interface à valider avec Unity.
+## Épisodes et récompenses
 
-| Clé | Espace Gymnasium | Sémantique |
-| --- | --- | --- |
-| `move_target` | `Box(-1, 1, (3,))` | Cible de déplacement relative normalisée |
-| `shoot` | `Box(0, 1, (1,))` | Intensité de la frappe (tir ou passe) ; zéro sans déclenchement |
-| `jump` | `Discrete(2)` | Déclenchement du saut |
-| `tackle` | `Discrete(2)`, si activé | Déclenchement du tacle optionnel |
+Un but termine l'épisode (`terminated=True`). Les coupures de durée ou remises
+en jeu techniques sont signalées par `truncated`. Conserver
+`includeNextObservations` activé sur `TrainingBridge` pour le futur bootstrap.
 
-Le tacle est activé par `enable_tackle` lors de la construction de l'interface. Les règles d'exécution des commandes restent à définir avec Unity.
+Les récompenses sont calculées par `FootAgent` dans Unity et cumulées entre deux
+décisions. Valeurs par défaut du code, modifiables dans l'Inspector :
 
-## Récompenses prévues
+| Composante | Valeur par défaut |
+| --- | ---: |
+| But de l'équipe / but adverse | +1 / −1 |
+| Contact ou frappe du ballon | +0,02 |
+| Vitesse du ballon vers le but adverse | 0,1 × vitesse X normalisée × durée |
+| Temps écoulé | −0,005 × durée en secondes |
+| Distance au ballon et tacle réussi | Désactivées par défaut, coefficients nuls |
 
-`rewards.py` décrit les composantes de récompense prévues :
+Les algorithmes utilisent directement `batch.rewards`, calculé par Unity.
 
-- **Objectifs** : catégorie prévue, dont les règles d'attribution restent à définir.
-- **Apprentissage** : réduction de la distance au ballon, contact avec le ballon et tir cadré. En équipe, passes et buts précédés de passes, avec d'autres actions collaboratives éventuellement à préciser.
-- **Défense** : contact avec le ballon alors qu'il se dirige vers le propre but de l'agent et aurait pénétré dans la zone de but sans interception.
-- **Pénalités** : légère perte à chaque frame et pénalité de sortie du terrain.
+## Architecture Python
 
-Aucune valeur de récompense n'est imposée. Les coefficients seront déterminés expérimentalement et feront l'objet d'une étude de sensibilité. La détection des événements, le lieu du calcul entre Unity et Python et les règles d'attribution restent à définir. Les transitions fournies à l'algorithme contiennent la récompense associée.
+| Fichier | Rôle |
+| --- | --- |
+| `scripts/link_unity_bridge.py` | Lie le paquet Unity à l'environnement virtuel |
+| `src/football_rl/unity.py` | Collecteur commun, fabrique de politique, callbacks `iafoot` |
+| `src/football_rl/network.py` | Base des réseaux PyTorch |
+| `README_UNITY.md` | Configuration, protocole, utilisation et dépannage |
 
-## Entraînement et évaluation prévus
+Le transport, les lots et les exports sont définis dans le paquet du dépôt Unity :
+`iafoot.Batch`, `iafoot.TrainingServer`, `iafoot.UnityConnection`, `ModelExport`
+et `DecoderExport`. Les anciens contrats abstraits et l'environnement Gymnasium
+factice ont été supprimés. Aucune seconde définition du protocole n'est maintenue ici.
 
-La progression des récompenses et des statistiques de jeu sera suivie dans **TensorBoard**. Plusieurs logiques d'exploration/exploitation et des techniques d'accélération, dont plusieurs agents jouant simultanément, sont envisagées. L'auto-compétition contre le même modèle ou un autre algorithme RL est également envisagée.
+## Brancher un algorithme
 
-Les algorithmes seront comparés à une **heuristique réactive** orientant le joueur vers le ballon puis vers le but adverse. L'évaluation portera sur la vitesse d'apprentissage, la stabilité et la généralisation : taux de victoire, différence moyenne de buts, buts marqués et encaissés, récompense moyenne, temps d'entraînement et performances face à des adversaires jamais rencontrés ou dans d'autres configurations. Les modèles pourront aussi être affrontés par des joueurs humains. Ces mécanismes ne sont pas encore implémentés.
+Le collecteur accepte une fabrique `module:fonction`. Elle reçoit
+`(behavior, seed)` et retourne `(ModelExport, DecoderExport)`.
 
-## Prochaines étapes
+```powershell
+python -m football_rl.unity --policy-factory mon_paquet.politique:build_policy
+```
 
-1. Définir le protocole, le format des lots et l'export/chargement du réseau avec Unity.
-2. Implémenter la collecte dans Unity et la boucle réception, entraînement et renvoi du réseau dans Python ; préciser le raccordement Gymnasium.
-3. Définir les maxima de joueurs, la normalisation et les événements de récompense, puis étudier les coefficients.
-4. Implémenter les algorithmes à comparer, l'heuristique de référence et le suivi TensorBoard.
-5. Évaluer le 1v1, puis augmenter progressivement les effectifs en conservant le format d'observation ; étudier la coopération et la généralisation.
+Le dictionnaire `behavior` provient du message `hello` : taille et noms des
+observations, description des actions, période de décision et agents. Le guide
+[README_UNITY.md](README_UNITY.md) précise le contrat de la fabrique.
+
+Pour une véritable boucle d'apprentissage, chaque algorithme conserve son propre
+état et utilise les callbacks du `TrainingServer` pour traiter les lots et publier
+ses modèles. Le collecteur commun sert à l'intégration et au diagnostic.
+
+## Organisation du travail
+
+`main` contient uniquement l'infrastructure et la documentation communes. Chaque
+algorithme dispose d'une branche et d'une documentation dédiées. Les contributions
+communes sont intégrées aux branches d'algorithmes avant leur publication sur
+`main` ; les fichiers communs restent identiques entre les branches synchronisées.
+
+Les buffers, fonctions de coût, optimisations et stratégies d'évaluation relèvent
+de chaque algorithme. TensorBoard est disponible avec `tensorboard --logdir runs`
+sur `http://localhost:6006`. La collecte de diagnostic n'écrit pas de métriques.

@@ -7,7 +7,7 @@ from torch import nn
 
 
 class FootballNetwork(nn.Module, ABC):
-    """Base des réseaux comparés, avec une entrée fixe incluant les masques."""
+    """Base des réseaux : dimension d'entrée fixe pour un schéma d'observation."""
 
     def __init__(self, observation_size: int) -> None:
         super().__init__()
@@ -15,5 +15,5 @@ class FootballNetwork(nn.Module, ABC):
 
     @abstractmethod
     def forward(self, observations: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Sorties et exploitation des masques à définir selon l'algorithme."""
+        """Sorties nommées propres au réseau, calculées sur un lot d'observations."""
         raise NotImplementedError
