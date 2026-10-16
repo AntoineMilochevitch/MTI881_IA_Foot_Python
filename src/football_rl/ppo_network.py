@@ -14,6 +14,7 @@ import math
 
 import torch
 from torch import nn
+from torch.distributions import Normal, Bernoulli
 
 from football_rl.network import FootballNetwork
 
@@ -119,3 +120,101 @@ class PPOActorNetwork(FootballNetwork):
             "continuous_log_std": continuous_log_std,
             "binary_logits": binary_logits
         }
+        
+    @staticmethod
+    def calculate_log_prob(
+        normal_dist: Normal,
+        bernoulli_dist: Bernoulli,
+        continuous_actions: torch.Tensor,
+        binary_actions: torch.Tensor
+    ) -> torch.Tensor:
+        """Calcule le log_prob d'une action donnée sous la politique.
+
+        normal_dist :
+            distribution normale pour les actions continues
+        bernoulli_dist :
+            distribution de Bernoulli pour les actions binaires
+        continuous_actions :
+            actions continues de forme (B, 4)
+        binary_actions :
+            actions binaires de forme (B, 3)
+
+        Retour :
+            log_prob : (B,)
+        """
+        # Actions continues : (B, 4)
+        log_prob_continuous = normal_dist.log_prob(continuous_actions)
+
+        # Actions binaires : (B, 3) - Convention Unity
+        p = bernoulli_dist.probs
+        q = torch.where(binary_actions == 1, p, 1.0 - p)
+        log_prob_binary = torch.log(q.clamp(min=1e-8))
+
+        # Log-probabilité totale : (B,)
+        return log_prob_continuous.sum(dim=-1) + log_prob_binary.sum(dim=-1)
+        
+    def sample_action(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Échantillonne une action à partir de la politique.
+
+        x :
+            observations de forme (B, D)
+
+        Retour :
+            action : (B, 7)
+            log_prob : (B,)
+        """
+        
+        forward_output = self.forward(x)
+        continuous_mean = forward_output["continuous_mean"]
+        continuous_log_std = forward_output["continuous_log_std"]
+        binary_logits = forward_output["binary_logits"]
+        
+        # Échantillonnage des actions continues
+        std = torch.exp(continuous_log_std)
+        normal_dist = torch.distributions.Normal(continuous_mean, std)
+        continuous_action = normal_dist.sample()
+        
+        # Échantillonnage des actions binaires
+        bernoulli_dist = torch.distributions.Bernoulli(logits=binary_logits)
+        binary_action = bernoulli_dist.sample()
+        
+        # Combinaison des actions continues et binaires
+        action = forward_output["model_output"].new_zeros((x.shape[0], 7))
+        action[:, self.CONTINUOUS_INDICES] = continuous_action
+        action[:, self.BINARY_INDICES] = binary_action
+        
+        log_prob = self.calculate_log_prob(normal_dist, bernoulli_dist, continuous_action, binary_action)
+        
+        return action, log_prob
+    
+    def evaluate_action(self, x: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Évalue la log-probabilité d'une action donnée sous la politique.
+
+        x :
+            observations de forme (B, D)
+        action :
+            actions de forme (B, 7)
+
+        Retour :
+            log_prob : (B,)
+        """
+        
+        forward_output = self.forward(x)
+        continuous_mean = forward_output["continuous_mean"]
+        continuous_log_std = forward_output["continuous_log_std"]
+        binary_logits = forward_output["binary_logits"]
+        
+        # Distribution pour les actions continues
+        std = torch.exp(continuous_log_std)
+        normal_dist = torch.distributions.Normal(continuous_mean, std)
+        
+        # Distribution pour les actions binaires
+        bernoulli_dist = torch.distributions.Bernoulli(logits=binary_logits)
+        
+        # Séparation des actions continues et binaires
+        continuous_action = action[:, self.CONTINUOUS_INDICES]
+        binary_action = action[:, self.BINARY_INDICES]
+        
+        log_prob = self.calculate_log_prob(normal_dist, bernoulli_dist, continuous_action, binary_action)
+        
+        return log_prob
