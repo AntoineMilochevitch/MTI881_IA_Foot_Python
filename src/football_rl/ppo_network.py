@@ -4,8 +4,8 @@ Les observations sont des lots de forme (B, D), où B est le nombre de
 situations et D la dimension obs_size annoncée dans le hello Unity. Le critique
 prédit un retour par situation ; l'acteur produit quatre moyennes continues et
 trois logits binaires. Quatre log-écarts-types sont appris séparément du MLP.
-L'échantillonnage Python, l'évaluation des actions et l'optimisation PPO restent
-à construire. Voir README_PPO.md pour les contrats et les prochaines étapes.
+L'échantillonnage et l'évaluation des actions suivent les conventions du pont.
+L'optimisation est dans ppo_training.py ; le cycle Unity dans ppo_trainer.py.
 
 Ce module ne normalise pas les données Unity et ne simule pas le match.
 """
