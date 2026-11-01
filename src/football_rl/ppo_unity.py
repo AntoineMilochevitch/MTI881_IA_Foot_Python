@@ -2,7 +2,9 @@
 
 import argparse
 from dataclasses import fields
+from datetime import datetime
 import logging
+from pathlib import Path
 import sys
 from typing import Any
 
@@ -51,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="écart absolu maximal accepté entre logp Python et Unity")
     parser.add_argument("--collect-only", action="store_true",
                         help="vérifie les données et log-probabilités sans optimiser")
+    parser.add_argument("--log-dir", default="runs",
+                        help="dossier racine des logs TensorBoard")
+    parser.add_argument("--run-name", default=None,
+                        help="nom de l'expérience (défaut : ppo_AAAAMMJJ-HHMMSS)")
+    parser.add_argument("--no-tensorboard", action="store_true",
+                        help="désactive le suivi TensorBoard")
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -63,6 +71,13 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("--port doit être entre 1 et 65535.")
+
+    if args.no_tensorboard:
+        args.log_dir = None
+    else:
+        run_name = args.run_name or datetime.now().strftime("ppo_%Y%m%d-%H%M%S")
+        args.log_dir = str(Path(args.log_dir) / run_name)
+
     try:
         config = PPOTrainerConfig(**{
             field.name: getattr(args, field.name) for field in fields(PPOTrainerConfig)
@@ -85,10 +100,17 @@ def main(argv: list[str] | None = None) -> None:
         "PPO : %s, lot Unity=%d, rollout=%d, mini-lot=%d, époques=%d.",
         mode, config.batch_size, config.rollout_size, config.mini_batch_size, config.num_epochs,
     )
+
+    if config.log_dir is not None and not config.collect_only:
+        logging.getLogger(__name__).info("TensorBoard : %s", config.log_dir)
+
     try:
         server.serve_forever()
     finally:
-        server.stop()
+        try:
+            server.stop()
+        finally:
+            trainer.close()
 
 
 if __name__ == "__main__":

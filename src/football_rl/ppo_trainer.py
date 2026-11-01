@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import logging
 import math
 from time import perf_counter
+from collections import deque
 
 import torch
 from iafoot import Batch, UnityConnection
@@ -18,8 +19,9 @@ from football_rl.ppo_export import export_actor
 from football_rl.ppo_network import PPOActorNetwork, PPOValueNetwork
 from football_rl.ppo_training import compute_policy_metrics, train_ppo
 from football_rl.unity import ACTION_SCHEMA
+from football_rl.ppo_logging import PPOTensorBoardLogger
 
-
+CONTINUOUS_STD_NAMES = ("move_x", "move_z", "shoot_power", "shoot_curve")
 logger = logging.getLogger(__name__)
 
 
@@ -44,6 +46,7 @@ class PPOTrainerConfig:
     target_kl: float | None = 0.01
     parity_atol: float = 1e-4
     collect_only: bool = False
+    log_dir: str | None = None
 
     def __post_init__(self) -> None:
         if not self.behavior.strip():
@@ -116,6 +119,13 @@ class PPOUnityTrainer:
         self.last_history: list[dict[str, float | int | bool]] = []
         self.last_parity: dict[str, float] = {}
         self.rollout_max_log_prob_error = 0.0
+
+        self.collection_started_at = None
+        # Borné : évite une croissance sans fin si aucun cycle ne vide la liste.
+        self.episode_summaries = deque(maxlen=10_000)
+        self.tb_logger = None
+        if config.log_dir is not None and not config.collect_only:
+            self.tb_logger = PPOTensorBoardLogger(config.log_dir, config)
 
     def _set_error(self, error: Exception) -> None:
         self.error = str(error)
@@ -265,6 +275,7 @@ class PPOUnityTrainer:
             self.last_parity = {}
             logger.info("Politique v%d acceptée ; collecte de %d transitions au minimum.",
                         self.active_version, self.config.rollout_size)
+            self.collection_started_at = perf_counter()
             return
 
         self._set_error(RuntimeError(str(header.get("error", "Unity a refusé le modèle."))))
@@ -314,6 +325,12 @@ class PPOUnityTrainer:
         """Garde uniquement la version acquittée, puis déclenche un cycle PPO."""
         if connection is not self.connection or batch.behavior != self.behavior:
             return
+        if self.tb_logger is not None:
+            # Séparé du filtrage du buffer PPO : ces épisodes sont déjà terminés même si les transitions du lot sont ignorées.
+            try:
+                self.episode_summaries.extend(getattr(batch, "episodes", None) or ())
+            except Exception:
+                logger.warning("Suivi TensorBoard : résumés d'épisodes ignorés", exc_info=True)
         if self.phase != "collecting":
             self.ignored_transitions += len(batch)
             return
@@ -367,6 +384,7 @@ class PPOUnityTrainer:
                 )
             logger.info("Entraînement terminé en %.2f s ; %d transitions entraînées, %d ignorées au total.",
                         perf_counter() - start, self.trained_transitions, self.ignored_transitions)
+            self._log_tensorboard(sample_count, start)
             self._publish_actor()
         except Exception as error:
             # Le serveur conserve la connexion après une exception : il faut
@@ -384,4 +402,38 @@ class PPOUnityTrainer:
         self.pending_version = None
         self.active_version = None
         self.phase = "disconnected"
+        self.episode_summaries.clear()
         logger.info("Unity déconnecté ; collecte abandonnée, réseaux et optimiseurs conservés en mémoire.")
+
+    def _log_tensorboard(self, sample_count: int, optimization_started_at: float) -> None:
+        """Écrit le cycle qui vient de se terminer."""
+        if self.tb_logger is None:
+            return
+        try:
+            step = self.trained_transitions
+            extras = {
+                "time/optimization_s": perf_counter() - optimization_started_at,
+                "data/rollout_transitions": sample_count,
+                "data/ignored_transitions_total": self.ignored_transitions,
+                "parity/max_log_prob_error": self.rollout_max_log_prob_error,
+            }
+            if self.collection_started_at is not None:
+                extras["time/collection_s"] = optimization_started_at - self.collection_started_at
+            # Exploration : écarts-types réellement utilisés (log_std borné puis exponentié).
+            with torch.no_grad():
+                stds = torch.exp(self.actor.log_std.clamp(-5.0, 2.0)).cpu().tolist()
+            for name, std in zip(CONTINUOUS_STD_NAMES, stds):
+                extras[f"exploration/std_{name}"] = std
+
+            self.tb_logger.log_cycle(step, self.last_history, extras)
+            self.tb_logger.log_episodes(step, list(self.episode_summaries))
+            self.episode_summaries.clear()
+        except Exception:
+            # Le suivi est secondaire : on ne met jamais le trainer en erreur pour lui.
+            logger.warning("Suivi TensorBoard ignoré pour ce cycle.", exc_info=True)
+
+    def close(self) -> None:
+        """Vide et ferme TensorBoard ; à appeler à l'arrêt de Python."""
+        if self.tb_logger is not None:
+            self.tb_logger.close()
+            self.tb_logger = None
