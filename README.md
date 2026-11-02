@@ -12,7 +12,7 @@ calcule les récompenses. Python exporte les modèles et reçoit les transitions
 | Envoi d'une politique et réception des lots | Disponible avec `python -m football_rl.unity` |
 | Export | Modèles et décodeurs fournis par `iafoot.models` |
 | Algorithmes, buffers, pertes, optimiseurs et checkpoints | Développés dans les branches dédiées |
-| TensorBoard | Dépendance installée ; métriques à brancher |
+| TensorBoard | Dépendance disponible ; enregistrement et métriques propres à chaque algorithme |
 
 La commande de collecte utilise par défaut une politique linéaire de démonstration.
 Une fabrique configurable permet d'envoyer le modèle d'un algorithme. Les lots
@@ -187,5 +187,23 @@ communes sont intégrées aux branches d'algorithmes avant leur publication sur
 `main` ; les fichiers communs restent identiques entre les branches synchronisées.
 
 Les buffers, fonctions de coût, optimisations et stratégies d'évaluation relèvent
-de chaque algorithme. TensorBoard est disponible avec `tensorboard --logdir runs`
-sur `http://localhost:6006`. La collecte de diagnostic n'écrit pas de métriques.
+de chaque algorithme. Sa documentation précise les métriques enregistrées et les
+options de sauvegarde/reprise. La collecte commune de diagnostic n'écrit pas de métriques.
+
+## Consulter les expériences avec TensorBoard
+
+Depuis la racine du dépôt, dans un deuxième terminal avec `.venv` activé :
+
+```powershell
+python -m tensorboard.main --logdir runs --port 6006
+```
+
+Ouvrir [TensorBoard](http://localhost:6006), puis sélectionner les expériences
+dans **Runs** et les courbes dans **Scalars** ou **Time Series**. Le serveur lit
+les fichiers d'événements écrits par les boucles d'entraînement ; il peut aussi
+afficher des expériences terminées. Le dossier `runs` doit contenir des événements
+pour qu'il y ait des courbes. TensorFlow n'est pas nécessaire pour ces métriques PyTorch.
+
+Conserver un dossier distinct par exécution et consulter la documentation de
+l'algorithme pour connaître le sens de l'axe **Step** et des mesures. Les fichiers
+TensorBoard décrivent l'entraînement ; les checkpoints conservent les modèles.

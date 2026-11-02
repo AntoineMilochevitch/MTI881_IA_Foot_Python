@@ -17,9 +17,12 @@ Le [README général](README.md) précise les observations/actions et le
 | PPO-Clip, optimiseurs séparés, mini-lots et arrêt KL | Implémentés |
 | Collecte → entraînement → export → accusé de réception | Raccordés dans `PPOUnityTrainer` |
 | Contrôle des log-probabilités Python/Unity | À chaque lot retenu, avant entraînement |
-| Tests locaux d'intégration | Connexion simulée, vrais exports et mises à jour PyTorch |
-| Validation dans une partie Unity réelle | À effectuer avec `--collect-only`, puis en entraînement |
-| Checkpoints, suivi TensorBoard et évaluation | À écrire |
+| Tests versionnés | Sauvegarde/restauration du critique et d'Adam, journalisation TensorBoard |
+| Validation dans une partie Unity réelle | Collecte, entraînement CUDA et reprise après redémarrage vérifiés |
+| Checkpoints | Sauvegarde après chaque cycle et archives tous les dix cycles |
+| TensorBoard | Métriques d'apprentissage et résumés d'épisodes enregistrés |
+| Adversaire `SimpleBotInput` | Configuration réseau contre bot utilisée dans Unity |
+| Évaluation à politique figée | `--evaluate` avec reprise d'un checkpoint |
 
 La boucle d'apprentissage est désormais exécutable. Unity produit les
 observations, joue les actions, calcule les récompenses et transmet les
@@ -62,7 +65,8 @@ Une incohérence arrête la collecte PPO dans l'état `error` ; les messages
 suivants ne déclenchent aucun apprentissage. Le serveur TCP reste ouvert.
 Vérifier les observations, les actions **brutes**, l'ordre des commandes et
 le décodeur avant de modifier la tolérance. Sa valeur initiale `1e-4` est
-configurable ; elle n'a pas encore été validée sur une exécution C# réelle.
+configurable ; les premiers essais C# ont montré des écarts de l'ordre de
+`1e-6`, inférieurs à ce seuil. Le contrôle reste nécessaire à chaque collecte.
 
 ### Lancer l'entraînement
 
@@ -95,6 +99,165 @@ Pour afficher toutes les options :
 python -m football_rl.ppo_unity --help
 ```
 
+### Sauvegarder et reprendre
+
+La commande crée automatiquement `runs/<run_name>` pour TensorBoard et
+`checkpoints/<run_name>` pour les sauvegardes. Sans `--run-name`, le nom est
+horodaté. `--checkpoint-dir` remplace le dossier de sauvegarde complet.
+
+```powershell
+# Nouvel entraînement : à utiliser pour une nouvelle expérience.
+python -m football_rl.ppo_unity --device cuda --rollout-size 512 --run-name ppo_bot_reference_01
+
+# Reprise : après avoir arrêté la précédente exécution.
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/ppo_bot_reference_01/latest.pt --run-name ppo_bot_reference_01_reprise
+```
+
+Pour prolonger l'essai existant, le point de départ disponible est par exemple
+`checkpoints/checkpoint_test_reprise/latest.pt`. Utiliser `--resume` : un
+lancement sans cette option initialise une nouvelle politique.
+
+- `latest.pt` est remplacé après chaque cycle réussi, avant l'envoi du modèle suivant.
+- Une archive `cycle_000010.pt`, `cycle_000020.pt`, etc. est conservée tous les dix cycles.
+- L'écriture passe par un fichier temporaire dans le même dossier, puis le remplace.
+- Aucune sauvegarde automatique n'est créée avant le premier cycle terminé.
+- `--collect-only` ne déclenche ni optimisation, ni sauvegarde automatique, ni TensorBoard.
+
+Le checkpoint contient l'acteur complet, dont `log_std`, le critique, les deux
+Adam, les quatre compteurs, le schéma Unity, la configuration et l'état aléatoire
+PyTorch CPU. Il ne sauvegarde pas le buffer, les sockets, la partie Unity, les
+états aléatoires Unity/CUDA ou les résumés d'épisodes en attente.
+
+À la reprise, les réglages sauvegardés sont prioritaires. Seuls `device`, `log_dir`, `collect_only`, `evaluate` et
+`evaluation_episodes` sont remplacés dans la configuration par les options
+du nouveau lancement. Les options de transport et de dossier restent celles
+du lancement. Par exemple, `--rollout-size 2048` ne remplace pas une valeur 512
+enregistrée dans le checkpoint. La console annonce cette règle.
+
+Les réseaux sont restaurés après validation du schéma, avant leur publication.
+Le placement CPU/GPU est choisi avec `--device`, qui vaut CPU par défaut.
+Unity doit acquitter le modèle avant la création d'un nouveau buffer.
+Une reconnexion ultérieure conserve les progrès en mémoire et ne recharge pas
+le fichier. Le compteur de versions peut différer du nombre de cycles :
+il compte les publications, dont celles provoquées par les reconnexions.
+
+Une interruption au milieu d'un cycle repart du dernier checkpoint réussi ;
+il n'y a pas de sauvegarde des pas d'optimisation partiels à la fermeture.
+Conserver les mêmes réglages de scène : le schéma ne vérifie pas les récompenses
+ni les valeurs `positionScale` et `velocityScale`, absentes du `hello`.
+
+### Évaluer un checkpoint
+
+L'évaluation exige un checkpoint et n'entraîne pas les réseaux. Elle retient
+uniquement les épisodes dont toutes les transitions proviennent de la politique
+évaluée et arrête le comptage après 200 épisodes admissibles par défaut :
+
+```powershell
+python -m football_rl.ppo_unity --resume checkpoints/ppo_bot_reference_01/latest.pt --evaluate
+```
+
+Modifier la cible avec `--evaluation-episodes`. Les épisodes exclus pour
+interruption technique sont signalés séparément et ne sont pas comptés comme
+des défaites.
+
+### Ouvrir TensorBoard
+
+Les métriques sont activées par défaut pendant l'entraînement. Depuis la racine
+du dépôt, ouvrir un deuxième terminal, activer le même `.venv`, puis lancer :
+
+```powershell
+python -m tensorboard.main --logdir runs --port 6006
+```
+
+Ouvrir [TensorBoard](http://localhost:6006). Ce serveur lit les fichiers
+d'événements ; il ne commande pas l'entraînement. Il peut rester ouvert pendant
+que Unity joue et afficher les fichiers après l'arrêt de Python.
+
+1. Dans **Runs**, sélectionner l'expérience en cours, par exemple
+   `checkpoint_test_reprise`. Une reprise est une continuation, pas un essai indépendant.
+2. Dans **Scalars** ou **Time Series**, afficher les groupes `episodes`, `ppo`,
+   `loss` et `exploration`.
+3. Choisir **Step** comme axe horizontal : ici, c'est le total de transitions
+   utilisées pour l'apprentissage, ni le nombre d'époques ni le nombre de parties.
+4. Commencer avec **Smoothing = 0**, puis essayer un lissage modéré, par exemple
+   0,5, pour voir une tendance. Revenir aux points bruts pour contrôler les pics.
+5. L'onglet **Text** contient la configuration enregistrée au lancement.
+
+Un point est écrit après un cycle terminé ; les métriques d'optimisation
+proviennent de sa dernière époque effectuée. Les courbes d'épisodes ne reçoivent
+pas de point si aucun résumé d'épisode n'a été accumulé. Une collecte encore
+en cours peut donc laisser les courbes immobiles.
+
+Les réglages disponibles sont `--log-dir`, `--run-name` et `--no-tensorboard`.
+Utiliser un nouveau nom de run à la reprise, tout en conservant le compteur de
+transitions restauré. Les nouveaux points commencent après ce compteur.
+
+Si aucune courbe n'apparaît :
+
+- vérifier le dossier affiché au lancement, le répertoire courant et la sélection des runs ;
+- attendre la fin d'un cycle et rafraîchir l'interface ;
+- vérifier que `--no-tensorboard` et `--collect-only` ne sont pas actifs ;
+- inspecter les fichiers avec `python -m tensorboard.main --inspect --logdir runs`.
+
+Le message `TensorFlow installation not found - running with reduced feature set`
+n'empêche pas l'affichage de ces métriques PyTorch. Si le port est occupé, choisir
+par exemple `--port 6007` et ouvrir le même port dans le navigateur.
+
+### Lire les courbes de jeu en premier
+
+| Courbe | Ce qu'elle mesure | Comment la lire |
+| --- | --- | --- |
+| `episodes/outcome_goal_scored` | Fraction des résumés terminés par un but de l'équipe de l'agent | Une hausse durable est encourageante, mais un but adverse contre son camp peut aussi compter |
+| `episodes/outcome_goal_conceded` | Fraction terminée par un but encaissé | Chercher une baisse en vérifiant les autres types de fin |
+| `episodes/outcome_timeout` | Fraction terminée par la limite de pas | Une hausse peut signifier mieux défendre ou simplement rester bloqué |
+| `episodes/return_mean` | Moyenne des sommes de récompenses par épisode | Contient les buts, contacts et récompenses intermédiaires ; ce n'est pas le score du match |
+| `episodes/return_std` | Écart-type de ces retours | Décrit leur dispersion, pas un intervalle de confiance |
+| `episodes/length_mean` | Nombre moyen de décisions par épisode | Plus long n'est pas toujours mieux : lire avec les buts et limites de temps |
+| `episodes/count` | Nombre de résumés utilisés pour ce point | Ce n'est pas un cumul ; une proportion basée sur deux épisodes est fragile |
+| `episodes/outcome_interrupted` et autres `outcome_*` | Fractions des autres types de fin, dont `disabled` ou `match_over` lorsqu'ils apparaissent | Les distinguer des résultats de jeu |
+
+Les agrégats portent sur les résumés accumulés depuis le précédent enregistrement,
+pas sur une fenêtre glissante fixe ni sur tous les épisodes depuis le lancement.
+Par exemple, 0,25 pour `outcome_goal_scored` signifie 25 % des résumés de ce point.
+Un épisode correspond à une manche jusqu'au but ou à une coupure, pas à un match
+complet. Le lissage de l'interface ne pondère pas les points par `episodes/count`.
+
+Ces statistiques décrivent la collecte, pendant laquelle la politique évolue.
+Un épisode peut traverser plusieurs versions et ses résumés sont traités à part
+du filtrage des transitions. Avec plusieurs agents, ils sont regroupés :
+les résultats de deux équipes opposées peuvent se compenser. Pour le duel
+contre `SimpleBotInput`, seul le joueur réseau doit avoir `FootAgent` actif.
+
+Le suivi actuel n'enregistre pas le nombre de contacts avec le ballon,
+les tirs utiles, la possession ou les résultats par équipe. Une récompense
+négative reste un signal d'apprentissage ; le problème observé au démarrage est
+surtout la rareté des contacts et des expériences positives. Les vérifier aussi
+en regardant quelques manches.
+
+### Lire les courbes techniques ensuite
+
+| Courbe | Interprétation |
+| --- | --- |
+| `loss/actor` | Objectif PPO du lot ; peut être négatif, n'a pas à tendre vers zéro et ne mesure pas le niveau au football |
+| `loss/critic` | Erreur quadratique sur les retours cibles ; une valeur faible peut simplement refléter des défaites très prévisibles |
+| `ppo/approx_kl` | Changement de politique par rapport à la collecte, mesuré après l'époque ; à rapprocher du seuil enregistré |
+| `ppo/clip_fraction` | Fraction des ratios hors de `[1 - epsilon, 1 + epsilon]` ; avec epsilon 0,2, une valeur 0,20 signifie 20 % hors de `[0,8 ; 1,2]` |
+| `ppo/ratio_mean` | Ratio moyen après mise à jour ; proche de 1 ne garantit pas que chaque action a peu changé |
+| `ppo/epochs_done` | Nombre d'époques réellement effectuées, au maximum 4 par défaut |
+| `ppo/kl_limit_reached` | 1 si le seuil KL a arrêté les époques suivantes ; les mises à jour déjà effectuées sont conservées |
+| `grad/actor_norm`, `grad/critic_norm` | Moyennes des normes des gradients avant leur limitation ; elles peuvent dépasser `max_grad_norm` sans que la limitation soit défaillante |
+| `exploration/std_move_x`, `std_move_z`, `std_shoot_power`, `std_shoot_curve` (préfixe `exploration/`) | Écarts-types des quatre actions continues brutes, initialement 0,5 ; ce n'est pas une probabilité de 50 % ni une mesure du niveau de jeu |
+| `parity/max_log_prob_error` | Écart maximal Python/Unity avant optimisation ; doit rester sous `parity_atol`, par défaut `1e-4` |
+| `data/rollout_transitions` | Taille effective du rollout, qui peut dépasser le seuil demandé |
+| `data/ignored_transitions_total` | Total cumulé de lignes ignorées ; les changements de version en expliquent une partie |
+| `time/collection_s`, `time/optimization_s` | Durées réelles par cycle pour repérer où passe le temps ; pas des mesures de qualité du jeu |
+
+Le suivi d'exploration concerne les actions continues. Les probabilités et
+entropies des boutons ne sont pas encore journalisées. Une exploration qui baisse
+rapidement avec des résultats toujours mauvais mérite un diagnostic, mais il
+n'existe pas de valeur cible universelle. Un arrêt KL après une ou deux époques
+ne justifie pas à lui seul de changer les réglages.
+
 ### Collecteur générique
 
 Cette commande reste une **collecte de démonstration sans apprentissage** :
@@ -118,6 +281,8 @@ Le collecteur commun `football_rl.unity` reste indépendant de l'algorithme.
 | `ppo_training.py` | Pertes, normalisation des avantages, mini-lots, optimisation, métriques KL |
 | `ppo_trainer.py` | Configuration, callbacks, état de la connexion et cycle d'apprentissage |
 | `ppo_unity.py` | Arguments de lancement et branchement des callbacks de `iafoot.TrainingServer` |
+| `ppo_checkpoint.py` | Construction, écriture, validation et restauration des checkpoints |
+| `ppo_logging.py` | Configuration et métriques envoyées à TensorBoard |
 
 Les fichiers d'algorithme et ce document appartiennent au travail PPO ;
 `unity.py` et le paquet `iafoot` restent utilisables par les autres algorithmes.
@@ -280,7 +445,8 @@ l'exploration. `ModelExport` et `DecoderExport` sont envoyés ensemble par
 Le cycle implémenté dans `PPOUnityTrainer` est :
 
 1. **Connexion** : lire `hello`, vérifier le schéma, créer les réseaux et Adam
-   à la première connexion. La dimension `D` provient d'Unity.
+   à la première connexion. La dimension `D` provient d'Unity. En mode reprise,
+   restaurer le checkpoint après validation du schéma et avant publication.
 2. **Publication** : réserver une version supérieure à la version locale et
    à celle annoncée par Unity, envoyer acteur + décodeur et passer à
    `waiting_for_ack`. Aucun buffer n'est collecté dans cet état.
@@ -292,7 +458,9 @@ Le cycle implémenté dans `PPOUnityTrainer` est :
 5. **Apprentissage** : au seuil `rollout_size`, appeler `train_ppo`. Reconstruire
    les segments, calculer une fois les valeurs de référence, GAE et retours,
    normaliser les avantages puis entraîner sur plusieurs époques.
-6. **Nouvelle publication** : exporter les poids et les `log_std` mis à jour,
+6. **Suivi et sauvegarde** : incrémenter les compteurs, écrire les métriques
+   TensorBoard et sauvegarder le cycle terminé.
+7. **Nouvelle publication** : exporter les poids et les `log_std` mis à jour,
    abandonner le buffer utilisé et attendre l'acceptation de la version suivante.
 
 Unity continue à simuler pendant les mises à jour Python. Les tags
@@ -321,9 +489,10 @@ Le trainer accepte une seule connexion Unity active et un comportement.
 Un refus du modèle, une incohérence de données ou une erreur d'entraînement
 vide le buffer et place le trainer en `error`. Aucune nouvelle mise à jour
 n'est tentée sur ces données. Une erreur après plusieurs pas d'optimisation
-n'annule pas les pas déjà effectués : il n'y a pas encore de checkpoint de
-restauration. Après correction de la cause, relancer Python permet de repartir
-d'un état neuf ; une simple reconnexion conserve les poids déjà en mémoire.
+n'annule pas les pas déjà effectués. Après correction de la cause, relancer
+Python avec `--resume` sur le dernier checkpoint réussi permet de repartir de
+ce cycle terminé ; une simple reconnexion conserve les poids déjà en mémoire.
+Il n'y a pas de restauration automatique après une erreur.
 
 ## 8. PPO-Clip : principe
 
@@ -439,6 +608,11 @@ de collecte dans la mémoire GPU.
 | `--device` | `cpu` | Périphérique PyTorch : `cpu` ou `cuda[:index]` |
 | `--seed` | 0 | Initialisation et RNG PyTorch, sans piloter le RNG Unity |
 | `--collect-only` | désactivé | Diagnostic sans mise à jour des réseaux |
+| `--resume` | aucun | Checkpoint à restaurer au démarrage |
+| `--checkpoint-dir` | `checkpoints/<run_name>` | Dossier des sauvegardes |
+| `--log-dir` | `runs` | Racine des événements TensorBoard ; le nom du run est ajouté |
+| `--run-name` | `ppo_AAAAMMJJ-HHMMSS` | Nom de cette exécution |
+| `--no-tensorboard` | désactivé | Coupe la journalisation TensorBoard, sans couper les checkpoints |
 | `--verbose` | désactivé | Détail des messages et des lots retenus |
 
 `--host`, `--port` et `--behavior` permettent également de modifier la connexion.
@@ -450,32 +624,50 @@ Une graine Python identique ne rend pas à elle seule les matchs Unity reproduct
 python -m unittest discover -s tests -p "test_ppo*.py" -v
 ```
 
-Les tests de `tests/test_ppo_trainer.py` utilisent une connexion simulée, les
-vrais `iafoot.Batch`, l'évaluation NumPy des modèles exportés et un décodeur
-de test indépendant de `evaluate_action`. Ils couvrent notamment :
+Les fichiers présents dans `tests/` couvrent :
 
-- deux cycles complets de collecte, optimisation et publication ;
-- modification des réseaux et des `log_std`, cohérence du nouvel export ;
-- filtrage des versions mélangées et des messages en attente ;
-- attente du bon ack, refus, changement de schéma et erreurs d'envoi/export ;
-- reconnexion conservant les poids et les états Adam ;
-- arrêt sur incohérence des log-probabilités, données ou calculs non finis ;
-- mode diagnostic sans optimisation et branchement de la commande.
+- `test_ppo_checkpoint.py` : aller-retour après une mise à jour du critique,
+  avec vérification d'un paramètre et de son historique Adam ;
+- `test_ppo_logging.py` : écriture et relecture des événements TensorBoard,
+  agrégation des épisodes et comportement du suivi.
 
-Ces tests valident le raccordement Python. Ils ne lancent pas le moteur Unity
-et ne démontrent pas encore un apprentissage utile au football.
+Des vérifications ponctuelles ont également couvert un cycle simulé,
+la reprise avec une mise à jour identique sur CPU à données et RNG identiques,
+la reconnexion, les archives, le refus de schéma et le passage CPU/CUDA.
+Ces scénarios restent à intégrer durablement à la suite de tests.
+La reprise a aussi été essayée dans Unity. Ces vérifications techniques
+ne démontrent pas une amélioration du niveau de jeu.
 
 ## 12. Suite du travail
 
-1. Exécuter le diagnostic avec Unity, puis vérifier quelques cycles réels
-   `collecting → training → waiting_for_ack → collecting`.
-2. Ajouter les checkpoints : acteur, critique, optimiseurs et configuration.
-   Pour l'instant, arrêter Python perd l'entraînement ; la reconnexion seule
-   n'est pas une sauvegarde.
-3. Ajouter le suivi TensorBoard. La dépendance est installée, mais aucun
-   `SummaryWriter` n'est encore branché ; les métriques actuelles sont en console.
-4. Construire une évaluation à politique figée contre des adversaires de
-   référence, séparée des parties de collecte, pour mesurer les progrès.
-5. Étudier ensuite l'exploration et un éventuel bonus d'entropie, puis ajuster
-   les hyperparamètres à partir des mesures. Le critic loss ou le score d'une
-   partie isolée ne suffisent pas pour juger la qualité de la politique.
+La priorité actuelle est de prolonger l'expérience contre le même bot, en
+conservant PPO, les hyperparamètres, les récompenses, la scène et les réglages du
+bot. Le rollout de l'essai repris reste à 512. La continuation doit utiliser
+`--resume` après un arrêt de Python ; si le processus tourne déjà, le laisser continuer.
+
+Se donner des points de contrôle vers **10 000, 50 000 et 100 000 transitions
+entraînées au total**, en sautant un palier déjà dépassé. Ce sont des repères
+pratiques pour une première expérience, pas une garantie de progression ni un
+budget suffisant pour maîtriser le jeu. Il n'y a pas d'arrêt automatique à ces
+valeurs dans la commande actuelle.
+
+À chaque palier, relever les courbes d'épisodes sur plusieurs cycles, leurs
+effectifs, les statistiques PPO et quelques séquences de jeu. Garder le chemin
+du checkpoint correspondant. Observer les contacts avec le ballon en vidéo :
+ce compteur n'existe pas encore dans TensorBoard.
+
+Une hausse durable des buts marqués, une baisse des buts encaissés sans
+remplacement systématique par des timeouts, et des actions visiblement plus utiles
+justifient de prolonger. Une perte critique faible ou une manche gagnée isolée
+ne suffisent pas. Une erreur de parité, des valeurs non finies ou une collecte
+bloquée demandent un diagnostic immédiat, pas davantage de temps d'entraînement.
+
+Après cette phase de référence :
+
+1. Construire une évaluation à politique figée, avec le même bot et des côtés alternés.
+   Les courbes de collecte servent au suivi, pas à une comparaison contrôlée.
+2. Si les contacts et résultats restent rares sans tendance favorable, étudier
+   un apprentissage progressif : adversaire immobile, variante plus lente,
+   puis bot normal. Garder le bot de référence inchangé pour l'évaluation.
+3. Étudier ensuite les améliorations RL de [TODO_PPO.md](TODO_PPO.md), une idée
+   à la fois : exploration, critique, représentation, tâches auxiliaires, etc.

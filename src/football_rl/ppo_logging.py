@@ -88,10 +88,16 @@ class PPOTensorBoardLogger:
         except Exception:
             logger.warning("Suivi TensorBoard : épisodes non enregistrés.", exc_info=True)
 
+    def log_evaluation_interruptions(self, step: int, count: int) -> None:
+        """Enregistre séparément les épisodes exclus pour interruption technique."""
+        try:
+            self._write(step, {"evaluation/technical_interruptions": count})
+        except Exception:
+            logger.warning("Suivi TensorBoard : interruptions non enregistrées.", exc_info=True)
+
     def close(self) -> None:
         """Vide et ferme le fichier d'évènements"""
         self.writer.flush()
         self.writer.close()
-
 
 

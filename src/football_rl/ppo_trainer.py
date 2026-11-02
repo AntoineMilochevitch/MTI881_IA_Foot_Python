@@ -10,7 +10,7 @@ import logging
 import math
 from pathlib import Path
 from time import perf_counter
-from collections import deque
+from collections import Counter, deque
 
 import torch
 from iafoot import Batch, UnityConnection
@@ -55,6 +55,8 @@ class PPOTrainerConfig:
     parity_atol: float = 1e-4
     collect_only: bool = False
     log_dir: str | None = None
+    evaluate: bool = False
+    evaluation_episodes: int = 200
 
     def __post_init__(self) -> None:
         if not self.behavior.strip():
@@ -62,6 +64,7 @@ class PPOTrainerConfig:
         for name, minimum in (
             ("seed", 0), ("batch_size", 1), ("rollout_size", 2),
             ("mini_batch_size", 1), ("num_epochs", 1),
+            ("evaluation_episodes", 1),
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -84,6 +87,8 @@ class PPOTrainerConfig:
             raise ValueError("time_scale doit être compris entre 0.1 et 50, comme dans Unity.")
         if self.clip_epsilon >= 1:
             raise ValueError("clip_epsilon doit être inférieur à 1.")
+        if self.evaluate and self.collect_only:
+            raise ValueError("evaluate et collect_only ne peuvent pas être activés ensemble.")
         device = torch.device(self.device)
         if device.type not in ("cpu", "cuda"):
             raise ValueError("device doit être cpu ou cuda[:index].")
@@ -138,12 +143,18 @@ class PPOUnityTrainer:
         self.collection_started_at = None
         # Borné : évite une croissance sans fin si aucun cycle ne vide la liste.
         self.episode_summaries = deque(maxlen=10_000)
+        self.evaluation_episodes: list[dict[str, object]] = []
+        self.evaluation_finished = False
+        self.evaluation_episode_states: dict[
+            tuple[str, int, int], dict[str, object]
+        ] = {}
+        self.evaluation_technical_interruptions = 0
         self.tb_logger = None
         if config.log_dir is not None and not config.collect_only:
             self.tb_logger = PPOTensorBoardLogger(config.log_dir, config)
 
     def _save_checkpoint(self) -> None:
-        if self.config.collect_only or self.checkpoint_dir is None:
+        if self.config.collect_only or self.config.evaluate or self.checkpoint_dir is None:
             return
         progress = {
             "version_counter": self.version_counter,
@@ -298,6 +309,96 @@ class PPOUnityTrainer:
             self._set_error(error)
             raise
 
+    def _on_evaluation_batch(self, connection: UnityConnection, batch: Batch) -> None:
+        if self.evaluation_finished or self.phase != "collecting":
+            return
+
+        try:
+            session_id = (connection.hello or {}).get("session")
+            if not isinstance(session_id, str) or self.active_version is None:
+                return
+            PPORolloutBuffer._validate_shapes(batch, self.schema[0])
+
+            for index in range(len(batch.obs)):
+                key = (
+                    session_id,
+                    int(batch.agent_id[index]),
+                    int(batch.episode_id[index]),
+                )
+                state = self.evaluation_episode_states.setdefault(
+                    key, {"steps": set(), "all_active": True}
+                )
+                steps = state["steps"]
+                if not isinstance(steps, set):
+                    raise ValueError("État interne des épisodes d'évaluation invalide.")
+                step = int(batch.step[index])
+                if step in steps:
+                    state["all_active"] = False
+                steps.add(step)
+                if int(batch.model_version[index]) != self.active_version:
+                    state["all_active"] = False
+
+            active_mask = batch.model_version == self.active_version
+            if active_mask.any():
+                accepted = self.buffer.add_batch(batch, batch.batch_id, session_id)
+                if accepted:
+                    self._check_parity(self.buffer.chunks[-1])
+                self.buffer.clear()
+
+            for summary in getattr(batch, "episodes", None) or ():
+                key = (
+                    session_id,
+                    int(summary["agent_id"]),
+                    int(summary["episode_id"]),
+                )
+                state = self.evaluation_episode_states.pop(key, None)
+                length = int(summary["length"])
+                steps = state["steps"] if state is not None else set()
+                admissible = (
+                    state is not None
+                    and state["all_active"] is True
+                    and steps == set(range(length))
+                )
+                if not admissible:
+                    self.evaluation_technical_interruptions += 1
+                    continue
+                self.evaluation_episodes.append(dict(summary))
+                if len(self.evaluation_episodes) >= self.config.evaluation_episodes:
+                    self.evaluation_episodes = self.evaluation_episodes[
+                        :self.config.evaluation_episodes
+                    ]
+                    self.evaluation_finished = True
+                    break
+
+            if self.tb_logger is not None and self.evaluation_episodes:
+                step = len(self.evaluation_episodes)
+                self.tb_logger.log_episodes(step, self.evaluation_episodes)
+                self.tb_logger.log_evaluation_interruptions(
+                    step, self.evaluation_technical_interruptions
+                )
+            logger.info(
+                "Évaluation : %d/%d épisodes admissibles.",
+                len(self.evaluation_episodes),
+                self.config.evaluation_episodes,
+            )
+            if self.evaluation_finished:
+                self.phase = "evaluation_finished"
+                outcomes = Counter(
+                    str(episode["outcome"]) for episode in self.evaluation_episodes
+                )
+                logger.info(
+                    "Évaluation terminée : %d épisodes, goal_scored=%d, "
+                    "goal_conceded=%d, timeout=%d, interruptions techniques=%d.",
+                    len(self.evaluation_episodes),
+                    outcomes.get("goal_scored", 0),
+                    outcomes.get("goal_conceded", 0),
+                    outcomes.get("timeout", 0),
+                    self.evaluation_technical_interruptions,
+                )
+        except Exception as error:
+            self._set_error(error)
+            raise
+
     def on_model_ack(
         self,
         connection: UnityConnection,
@@ -381,6 +482,9 @@ class PPOUnityTrainer:
     def on_batch(self, connection: UnityConnection, batch: Batch) -> None:
         """Garde uniquement la version acquittée, puis déclenche un cycle PPO."""
         if connection is not self.connection or batch.behavior != self.behavior:
+            return
+        if self.config.evaluate:
+            self._on_evaluation_batch(connection, batch)
             return
         if self.tb_logger is not None:
             # Séparé du filtrage du buffer PPO : ces épisodes sont déjà terminés même si les transitions du lot sont ignorées.

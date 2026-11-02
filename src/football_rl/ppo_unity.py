@@ -54,6 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="écart absolu maximal accepté entre logp Python et Unity")
     parser.add_argument("--collect-only", action="store_true",
                         help="vérifie les données et log-probabilités sans optimiser")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="évalue un checkpoint sans entraîner")
+    parser.add_argument("--evaluation-episodes", type=int, default=defaults.evaluation_episodes,
+                        help="nombre d'épisodes admissibles à évaluer")
     parser.add_argument("--log-dir", default="runs",
                         help="dossier racine des logs TensorBoard")
     parser.add_argument("--run-name", default=None,
@@ -76,6 +80,12 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("--port doit être entre 1 et 65535.")
+    if args.evaluate and args.collect_only:
+        parser.error("--evaluate est incompatible avec --collect-only.")
+    if args.evaluate and args.resume is None:
+        parser.error("--evaluate exige --resume.")
+    if args.evaluation_episodes <= 0:
+        parser.error("--evaluation-episodes doit être un entier strictement positif.")
 
     run_name = args.run_name or datetime.now().strftime("ppo_%Y%m%d-%H%M%S")
     checkpoint_dir = args.checkpoint_dir or str(Path("checkpoints") / run_name)
@@ -105,6 +115,8 @@ def main(argv: list[str] | None = None) -> None:
                 "device": args.device,
                 "log_dir": args.log_dir,
                 "collect_only": args.collect_only,
+                "evaluate": args.evaluate,
+                "evaluation_episodes": args.evaluation_episodes,
             })
         config = PPOTrainerConfig(**config_values)
     except (ValueError, TypeError, RuntimeError) as error:
@@ -124,7 +136,13 @@ def main(argv: list[str] | None = None) -> None:
     server.on_batch = trainer.on_batch
     server.on_model_ack = trainer.on_model_ack
     server.on_disconnect = trainer.on_disconnect
-    mode = "diagnostic sans optimisation" if config.collect_only else "entraînement"
+    mode = (
+        "évaluation"
+        if config.evaluate
+        else "diagnostic sans optimisation"
+        if config.collect_only
+        else "entraînement"
+    )
     logging.getLogger(__name__).info(
         "PPO : %s, lot Unity=%d, rollout=%d, mini-lot=%d, époques=%d.",
         mode, config.batch_size, config.rollout_size, config.mini_batch_size, config.num_epochs,

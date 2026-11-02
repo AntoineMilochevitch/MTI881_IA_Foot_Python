@@ -81,6 +81,34 @@ Les agents de même `behaviorName` partagent la politique. Désactiver
 une politique différente. Un adversaire fixe nécessite un autre comportement
 ou un contrôleur de bot.
 
+### Jouer contre le bot existant
+
+Configurer les composants hors Play, éventuellement dans une copie de la scène :
+
+| Composant | Joueur contrôlé par le réseau | Adversaire scripté |
+| --- | --- | --- |
+| `PlayerController` | Activé | Activé |
+| `FootAgent` | Activé, `Record Experience` coché | Désactivé |
+| `SimpleBotInput` | Désactivé | Activé, à ajouter si absent |
+| `HumanPlayerInput` | Désactivé | Désactivé |
+
+Vérifier les équipes dans **Arena → Match Manager → Teams → Players**. Ces
+listes déterminent l'équipe au lancement, même si `PlayerController` affiche
+une valeur par défaut différente hors Play. Garder un seul contrôleur de commandes
+actif par joueur. Le bot reste présent dans les observations du réseau.
+
+Le menu **Préparer la scène** réactive les agents et désactive les bots sur tous
+les joueurs : son utilisation demande de refaire cette configuration mixte.
+Garder les paramètres du bot, les récompenses, les échelles d'observation et
+les conditions de départ fixes pendant une expérience de référence.
+
+Un bot fixe possède des règles et réglages constants ; `SimpleBotInput` utilise
+aussi de l'aléatoire. Entraîner contre lui ne constitue pas une évaluation à
+politique figée : le lancement propre à l'algorithme doit gérer ce second usage.
+
+Pour continuer à simuler hors focus, activer **Edit → Project Settings → Player
+→ Resolution and Presentation → Run In Background**, puis relancer Play.
+
 ### Ce que fait le serveur Python
 
 1. `on_connect` reçoit `hello` et sélectionne le comportement demandé.
