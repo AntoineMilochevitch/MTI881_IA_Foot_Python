@@ -11,6 +11,7 @@ from typing import Any
 import torch
 from iafoot import DecoderExport, ModelExport, TrainingServer
 
+from football_rl.ppo_checkpoint import load_checkpoint
 from football_rl.ppo_export import export_actor
 from football_rl.ppo_network import PPOActorNetwork
 from football_rl.ppo_trainer import PPOTrainerConfig, PPOUnityTrainer
@@ -57,6 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="dossier racine des logs TensorBoard")
     parser.add_argument("--run-name", default=None,
                         help="nom de l'expérience (défaut : ppo_AAAAMMJJ-HHMMSS)")
+    parser.add_argument("--resume", default=None,
+                        help="chemin du checkpoint à reprendre")
+    parser.add_argument("--checkpoint-dir", default=None,
+                        help="dossier des nouvelles sauvegardes")
     parser.add_argument("--no-tensorboard", action="store_true",
                         help="désactive le suivi TensorBoard")
     parser.add_argument("--verbose", action="store_true")
@@ -72,16 +77,36 @@ def main(argv: list[str] | None = None) -> None:
     if not 1 <= args.port <= 65535:
         parser.error("--port doit être entre 1 et 65535.")
 
+    run_name = args.run_name or datetime.now().strftime("ppo_%Y%m%d-%H%M%S")
+    checkpoint_dir = args.checkpoint_dir or str(Path("checkpoints") / run_name)
+    resume_checkpoint = None
+    if args.resume is not None:
+        try:
+            resume_checkpoint = load_checkpoint(args.resume)
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            parser.error(f"Impossible de charger le checkpoint : {error}")
+
     if args.no_tensorboard:
         args.log_dir = None
     else:
-        run_name = args.run_name or datetime.now().strftime("ppo_%Y%m%d-%H%M%S")
         args.log_dir = str(Path(args.log_dir) / run_name)
 
     try:
-        config = PPOTrainerConfig(**{
-            field.name: getattr(args, field.name) for field in fields(PPOTrainerConfig)
-        })
+        if resume_checkpoint is None:
+            config_values = {
+                field.name: getattr(args, field.name) for field in fields(PPOTrainerConfig)
+            }
+        else:
+            saved_config = resume_checkpoint["config"]
+            if not isinstance(saved_config, dict):
+                raise ValueError("La configuration du checkpoint doit être un dictionnaire.")
+            config_values = saved_config.copy()
+            config_values.update({
+                "device": args.device,
+                "log_dir": args.log_dir,
+                "collect_only": args.collect_only,
+            })
+        config = PPOTrainerConfig(**config_values)
     except (ValueError, TypeError, RuntimeError) as error:
         parser.error(str(error))
 
@@ -89,7 +114,11 @@ def main(argv: list[str] | None = None) -> None:
                         format="%(message)s")
     # Le RNG Python sert aux permutations des mini-lots ; Unity a son propre RNG.
     torch.manual_seed(config.seed)
-    trainer = PPOUnityTrainer(config)
+    trainer = PPOUnityTrainer(
+        config,
+        checkpoint_dir=checkpoint_dir,
+        resume_checkpoint=resume_checkpoint,
+    )
     server = TrainingServer(args.host, args.port, debug=args.verbose)
     server.on_connect = trainer.on_connect
     server.on_batch = trainer.on_batch
@@ -100,6 +129,10 @@ def main(argv: list[str] | None = None) -> None:
         "PPO : %s, lot Unity=%d, rollout=%d, mini-lot=%d, époques=%d.",
         mode, config.batch_size, config.rollout_size, config.mini_batch_size, config.num_epochs,
     )
+    if resume_checkpoint is not None:
+        logging.getLogger(__name__).info(
+            "Reprise : les réglages sauvegardés sont utilisés, sauf device, log_dir et collect_only."
+        )
 
     if config.log_dir is not None and not config.collect_only:
         logging.getLogger(__name__).info("TensorBoard : %s", config.log_dir)

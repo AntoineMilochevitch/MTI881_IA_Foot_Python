@@ -5,9 +5,10 @@ collecte et aucun batch n'est traité pendant une mise à jour. On ne bloque
 jamais un callback en attendant model_ack, qui arrivera dans un autre message.
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import logging
 import math
+from pathlib import Path
 from time import perf_counter
 from collections import deque
 
@@ -15,6 +16,13 @@ import torch
 from iafoot import Batch, UnityConnection
 
 from football_rl.ppo_buffer import PPORolloutBuffer
+from football_rl.ppo_checkpoint import (
+    build_checkpoint,
+    restore_networks,
+    restore_optimizers,
+    save_checkpoint,
+    validate_schema,
+)
 from football_rl.ppo_export import export_actor
 from football_rl.ppo_network import PPOActorNetwork, PPOValueNetwork
 from football_rl.ppo_training import compute_policy_metrics, train_ppo
@@ -89,8 +97,15 @@ class PPOTrainerConfig:
 class PPOUnityTrainer:
     """Conserve les réseaux et Adam entre les connexions d'une instance Unity."""
 
-    def __init__(self, config: PPOTrainerConfig) -> None:
+    def __init__(
+        self,
+        config: PPOTrainerConfig,
+        checkpoint_dir: str | Path | None = None,
+        resume_checkpoint: dict[str, object] | None = None,
+    ) -> None:
         self.config = config
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
+        self.pending_checkpoint = resume_checkpoint
         self.behavior = config.behavior
         self.seed = config.seed
         self.device = torch.device(config.device)
@@ -126,6 +141,31 @@ class PPOUnityTrainer:
         self.tb_logger = None
         if config.log_dir is not None and not config.collect_only:
             self.tb_logger = PPOTensorBoardLogger(config.log_dir, config)
+
+    def _save_checkpoint(self) -> None:
+        if self.config.collect_only or self.checkpoint_dir is None:
+            return
+        progress = {
+            "version_counter": self.version_counter,
+            "update_count": self.update_count,
+            "trained_transitions": self.trained_transitions,
+            "ignored_transitions": self.ignored_transitions,
+        }
+        checkpoint = build_checkpoint(
+            self.actor,
+            self.critic,
+            self.actor_optimizer,
+            self.critic_optimizer,
+            progress,
+            self.schema,
+            asdict(self.config),
+        )
+        save_checkpoint(checkpoint, str(self.checkpoint_dir / "latest.pt"))
+        if self.update_count % 10 == 0:
+            save_checkpoint(
+                checkpoint,
+                str(self.checkpoint_dir / f"cycle_{self.update_count:06d}.pt"),
+            )
 
     def _set_error(self, error: Exception) -> None:
         self.error = str(error)
@@ -211,6 +251,9 @@ class PPOUnityTrainer:
             if self.phase == "error":
                 return
             if self.actor is None:
+                pending_checkpoint = self.pending_checkpoint
+                if pending_checkpoint is not None:
+                    validate_schema(pending_checkpoint, schema)
                 with torch.random.fork_rng(devices=[]):
                     # Initialisation CPU sans modifier le RNG CUDA de l'appelant.
                     torch.random.default_generator.manual_seed(self.seed)
@@ -218,6 +261,20 @@ class PPOUnityTrainer:
                     critic = PPOValueNetwork(observation_size).to(self.device)
                 actor_optimizer = torch.optim.Adam(actor.parameters(), lr=self.actor_lr)
                 critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.critic_lr)
+                if pending_checkpoint is not None:
+                    restore_networks(pending_checkpoint, actor, critic)
+                    restore_optimizers(
+                        pending_checkpoint, actor_optimizer, critic_optimizer
+                    )
+                    restored_rng_state = pending_checkpoint["torch_rng_state"]
+                    if not isinstance(restored_rng_state, torch.Tensor):
+                        raise ValueError("L'état RNG CPU du checkpoint est invalide.")
+                    torch.set_rng_state(restored_rng_state)
+                    self.version_counter = pending_checkpoint["progress"]["version_counter"]
+                    self.update_count = pending_checkpoint["progress"]["update_count"]
+                    self.trained_transitions = pending_checkpoint["progress"]["trained_transitions"]
+                    self.ignored_transitions = pending_checkpoint["progress"]["ignored_transitions"]
+                    self.pending_checkpoint = None
                 self.actor, self.critic = actor, critic
                 self.actor_optimizer, self.critic_optimizer = actor_optimizer, critic_optimizer
 
@@ -385,6 +442,7 @@ class PPOUnityTrainer:
             logger.info("Entraînement terminé en %.2f s ; %d transitions entraînées, %d ignorées au total.",
                         perf_counter() - start, self.trained_transitions, self.ignored_transitions)
             self._log_tensorboard(sample_count, start)
+            self._save_checkpoint()
             self._publish_actor()
         except Exception as error:
             # Le serveur conserve la connexion après une exception : il faut
