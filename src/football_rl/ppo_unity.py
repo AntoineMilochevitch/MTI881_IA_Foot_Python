@@ -57,7 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evaluate", action="store_true",
                         help="évalue un checkpoint sans entraîner")
     parser.add_argument("--evaluation-episodes", type=int, default=defaults.evaluation_episodes,
-                        help="nombre d'épisodes admissibles à évaluer")
+                        help="nombre d'épisodes sportifs à évaluer (but marqué, encaissé ou timeout)")
+    parser.add_argument("--diagnostic-no-jump-tackle", action="store_true",
+                        help="désactive tacle et saut pendant une évaluation")
     parser.add_argument("--log-dir", default="runs",
                         help="dossier racine des logs TensorBoard")
     parser.add_argument("--run-name", default=None,
@@ -84,6 +86,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--evaluate est incompatible avec --collect-only.")
     if args.evaluate and args.resume is None:
         parser.error("--evaluate exige --resume.")
+    if args.diagnostic_no_jump_tackle and not args.evaluate:
+        parser.error("--diagnostic-no-jump-tackle exige --evaluate.")
     if args.evaluation_episodes <= 0:
         parser.error("--evaluation-episodes doit être un entier strictement positif.")
 
@@ -130,6 +134,7 @@ def main(argv: list[str] | None = None) -> None:
         config,
         checkpoint_dir=checkpoint_dir,
         resume_checkpoint=resume_checkpoint,
+        diagnostic_no_jump_tackle=args.diagnostic_no_jump_tackle,
     )
     server = TrainingServer(args.host, args.port, debug=args.verbose)
     server.on_connect = trainer.on_connect
@@ -150,6 +155,10 @@ def main(argv: list[str] | None = None) -> None:
     if resume_checkpoint is not None:
         logging.getLogger(__name__).info(
             "Reprise : les réglages sauvegardés sont utilisés, sauf device, log_dir et collect_only."
+        )
+    if args.diagnostic_no_jump_tackle:
+        logging.getLogger(__name__).info(
+            "Diagnostic : tacle et saut désactivés dans l'acteur en mémoire."
         )
 
     if config.log_dir is not None and not config.collect_only:

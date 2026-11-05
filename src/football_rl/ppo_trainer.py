@@ -107,10 +107,12 @@ class PPOUnityTrainer:
         config: PPOTrainerConfig,
         checkpoint_dir: str | Path | None = None,
         resume_checkpoint: dict[str, object] | None = None,
+        diagnostic_no_jump_tackle: bool = False,
     ) -> None:
         self.config = config
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
         self.pending_checkpoint = resume_checkpoint
+        self.diagnostic_no_jump_tackle = diagnostic_no_jump_tackle
         self.behavior = config.behavior
         self.seed = config.seed
         self.device = torch.device(config.device)
@@ -144,11 +146,13 @@ class PPOUnityTrainer:
         # Borné : évite une croissance sans fin si aucun cycle ne vide la liste.
         self.episode_summaries = deque(maxlen=10_000)
         self.evaluation_episodes: list[dict[str, object]] = []
+        self.evaluation_admissible_count = 0
         self.evaluation_finished = False
         self.evaluation_episode_states: dict[
             tuple[str, int, int], dict[str, object]
         ] = {}
         self.evaluation_technical_interruptions = 0
+        self.evaluation_other_outcomes: Counter[str] = Counter()
         self.tb_logger = None
         if config.log_dir is not None and not config.collect_only:
             self.tb_logger = PPOTensorBoardLogger(config.log_dir, config)
@@ -203,6 +207,15 @@ class PPOUnityTrainer:
             model, version=version, behavior=self.behavior, decoder=decoder
         )
         logger.info("Politique v%d envoyée ; attente de model_ack.", version)
+
+    @staticmethod
+    def _disable_jump_and_tackle(actor: PPOActorNetwork) -> None:
+        output_layer = actor.network[-1]
+        if not isinstance(output_layer, torch.nn.Linear) or output_layer.out_features != 7:
+            raise ValueError("La dernière couche de l'acteur n'est pas compatible avec le diagnostic.")
+        with torch.no_grad():
+            output_layer.weight[5:7].zero_()
+            output_layer.bias[5:7].fill_(-20.0)
 
     def on_connect(self, connection: UnityConnection) -> None:
         # Une connexion étrangère ne doit pas mettre le trainer actif en erreur.
@@ -277,6 +290,8 @@ class PPOUnityTrainer:
                     restore_optimizers(
                         pending_checkpoint, actor_optimizer, critic_optimizer
                     )
+                    if self.diagnostic_no_jump_tackle:
+                        self._disable_jump_and_tackle(actor)
                     restored_rng_state = pending_checkpoint["torch_rng_state"]
                     if not isinstance(restored_rng_state, torch.Tensor):
                         raise ValueError("L'état RNG CPU du checkpoint est invalide.")
@@ -343,6 +358,7 @@ class PPOUnityTrainer:
                 accepted = self.buffer.add_batch(batch, batch.batch_id, session_id)
                 if accepted:
                     self._check_parity(self.buffer.chunks[-1])
+                    self._log_action_diagnostics(self.buffer.chunks[-1])
                 self.buffer.clear()
 
             for summary in getattr(batch, "episodes", None) or ():
@@ -362,24 +378,28 @@ class PPOUnityTrainer:
                 if not admissible:
                     self.evaluation_technical_interruptions += 1
                     continue
-                self.evaluation_episodes.append(dict(summary))
+                self.evaluation_admissible_count += 1
+                outcome = str(summary["outcome"])
+                if outcome in {"goal_scored", "goal_conceded", "timeout"}:
+                    self.evaluation_episodes.append(dict(summary))
+                else:
+                    self.evaluation_other_outcomes[outcome] += 1
                 if len(self.evaluation_episodes) >= self.config.evaluation_episodes:
-                    self.evaluation_episodes = self.evaluation_episodes[
-                        :self.config.evaluation_episodes
-                    ]
                     self.evaluation_finished = True
                     break
 
+            sporting_count = len(self.evaluation_episodes)
             if self.tb_logger is not None and self.evaluation_episodes:
-                step = len(self.evaluation_episodes)
+                step = sporting_count
                 self.tb_logger.log_episodes(step, self.evaluation_episodes)
                 self.tb_logger.log_evaluation_interruptions(
                     step, self.evaluation_technical_interruptions
                 )
             logger.info(
-                "Évaluation : %d/%d épisodes admissibles.",
-                len(self.evaluation_episodes),
+                "Évaluation : %d/%d épisodes sportifs (%d épisodes complets reçus).",
+                sporting_count,
                 self.config.evaluation_episodes,
+                self.evaluation_admissible_count,
             )
             if self.evaluation_finished:
                 self.phase = "evaluation_finished"
@@ -387,17 +407,147 @@ class PPOUnityTrainer:
                     str(episode["outcome"]) for episode in self.evaluation_episodes
                 )
                 logger.info(
-                    "Évaluation terminée : %d épisodes, goal_scored=%d, "
+                    "Évaluation terminée : %d épisodes sportifs sur %d épisodes complets reçus, goal_scored=%d, "
                     "goal_conceded=%d, timeout=%d, interruptions techniques=%d.",
-                    len(self.evaluation_episodes),
+                    sporting_count,
+                    self.evaluation_admissible_count,
                     outcomes.get("goal_scored", 0),
                     outcomes.get("goal_conceded", 0),
                     outcomes.get("timeout", 0),
                     self.evaluation_technical_interruptions,
                 )
+                if self.evaluation_other_outcomes:
+                    logger.info(
+                        "Autres issues exclues du bilan sportif : %s.",
+                        dict(self.evaluation_other_outcomes),
+                    )
         except Exception as error:
             self._set_error(error)
             raise
+
+    def _log_action_diagnostics(self, chunk: dict[str, torch.Tensor]) -> None:
+        """Affiche les paramètres, commandes et réponses physiques par agent."""
+        observations = chunk["obs"].to(self.device)
+        actions = chunk["actions"]
+        agent_ids = chunk["agent_id"]
+        next_observations = chunk["next_obs"]
+        observation_names = self.schema[1]
+        required_names = (
+            "self_vel_x",
+            "self_vel_z",
+            "self_stunned",
+            "self_tackling",
+            "self_grounded",
+            "ball_rel_x",
+            "ball_rel_z",
+        )
+        missing_names = [name for name in required_names if name not in observation_names]
+        if missing_names:
+            raise ValueError(
+                "Observations nécessaires au diagnostic absentes : "
+                + ", ".join(missing_names)
+            )
+        observation_indices = {
+            name: observation_names.index(name) for name in required_names
+        }
+
+        with torch.no_grad():
+            output = self.actor(observations)
+            continuous_mean = output["continuous_mean"]
+            continuous_std = torch.exp(output["continuous_log_std"])
+            binary_probabilities = torch.sigmoid(output["binary_logits"])
+
+        for agent_id in torch.unique(agent_ids, sorted=True).tolist():
+            mask = agent_ids == agent_id
+            means = continuous_mean[mask.to(self.device), :2]
+            binary_probs = binary_probabilities[mask.to(self.device)]
+            selected_actions = actions[mask, :2]
+            stds = continuous_std[mask.to(self.device), :2]
+            clamped_actions = selected_actions.clamp(-1.0, 1.0)
+            command_norm = clamped_actions.norm(dim=1)
+            command = torch.where(
+                command_norm.unsqueeze(1) > 1.0,
+                clamped_actions / command_norm.clamp_min(1.0).unsqueeze(1),
+                clamped_actions,
+            )
+            horizontal_command = command.norm(dim=1)
+            velocity = next_observations[mask][
+                :, [observation_indices["self_vel_x"], observation_indices["self_vel_z"]]
+            ]
+            horizontal_speed = velocity.norm(dim=1) * 6.0
+            states = next_observations[mask]
+            current_states = chunk["obs"][mask]
+            normal_mask = (
+                ~chunk["terminated"][mask]
+                & ~chunk["truncated"][mask]
+                & (current_states[:, observation_indices["self_grounded"]] > 0.5)
+                & (current_states[:, observation_indices["self_stunned"]] <= 0.5)
+                & (current_states[:, observation_indices["self_tackling"]] <= 0.5)
+                & (states[:, observation_indices["self_grounded"]] > 0.5)
+                & (states[:, observation_indices["self_stunned"]] <= 0.5)
+                & (states[:, observation_indices["self_tackling"]] <= 0.5)
+            )
+            ball = current_states[
+                :, [observation_indices["ball_rel_x"], observation_indices["ball_rel_z"]]
+            ]
+            vector_norms = command.norm(dim=1)
+            ball_norms = ball.norm(dim=1)
+            alignment_mask = (vector_norms > 1e-8) & (ball_norms > 1e-8)
+            alignments = (
+                (command * ball).sum(dim=1)
+                / (vector_norms * ball_norms).clamp_min(1e-8)
+            )
+
+            diagnostics = []
+            for axis, axis_name in enumerate(("move_x", "move_z")):
+                predicted = means[:, axis]
+                chosen = selected_actions[:, axis]
+                std = stds[:, axis].mean().item()
+                below = (chosen < -1).to(torch.float32).mean().item()
+                above = (chosen > 1).to(torch.float32).mean().item()
+                diagnostics.append(
+                    f"{axis_name}: moyenne={predicted.mean().item():.4f}, "
+                    f"min={predicted.min().item():.4f}, "
+                    f"max={predicted.max().item():.4f}, std={std:.4f}, "
+                    f"f_-={below:.2%}, f_+={above:.2%}"
+                )
+            normal_count = int(normal_mask.sum().item())
+            if normal_count:
+                normal_commands = horizontal_command[normal_mask]
+                normal_speeds = horizontal_speed[normal_mask]
+                normal_message = (
+                    f"normal={normal_count}, commande_normale_moyenne="
+                    f"{normal_commands.mean().item():.4f}, "
+                    f"vitesse_normale_moyenne={normal_speeds.mean().item():.4f} unité/s"
+                )
+            else:
+                normal_message = "aucune donnée admissible en déplacement normal"
+            alignment_message = (
+                f"alignement_ballon_moyen={alignments[alignment_mask].mean().item():.4f}"
+                if alignment_mask.any()
+                else "alignement_ballon_indisponible"
+            )
+            logger.info(
+                "Diagnostic actions agent %s (%d transitions) : %s; "
+                "commande horizontale moyenne=%.4f; vitesse horizontale moyenne=%.4f unité/s; "
+                "stunned=%.2f%%, tackling=%.2f%%, grounded=%.2f%%; "
+                "p_tackle=%.2f%%, p_jump=%.2f%%, "
+                "tackle_1=%.2f%%, jump_1=%.2f%%; %s; %s",
+                agent_id,
+                int(mask.sum().item()),
+                "; ".join(diagnostics),
+                horizontal_command.mean().item(),
+                horizontal_speed.mean().item(),
+                states[:, observation_indices["self_stunned"]].mean().item() * 100,
+                states[:, observation_indices["self_tackling"]].mean().item() * 100,
+                states[:, observation_indices["self_grounded"]].mean().item() * 100,
+                binary_probs[:, 1].mean().item() * 100,
+                binary_probs[:, 2].mean().item() * 100,
+                (actions[mask, 5] == 1).to(torch.float32).mean().item() * 100,
+                (actions[mask, 6] == 1).to(torch.float32).mean().item() * 100,
+                normal_message,
+                alignment_message,
+            )
 
     def on_model_ack(
         self,

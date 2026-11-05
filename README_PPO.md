@@ -111,6 +111,9 @@ python -m football_rl.ppo_unity --device cuda --rollout-size 512 --run-name ppo_
 
 # Reprise : après avoir arrêté la précédente exécution.
 python -m football_rl.ppo_unity --device cuda --resume checkpoints/ppo_bot_reference_01/latest.pt --run-name ppo_bot_reference_01_reprise
+
+# Evaluation
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/solo_positions_variees/latest.pt --evaluate --evaluation-episodes 200 --run-name eval_bot_solo_01
 ```
 
 Pour prolonger l'essai existant, le point de départ disponible est par exemple
@@ -150,7 +153,8 @@ ni les valeurs `positionScale` et `velocityScale`, absentes du `hello`.
 
 L'évaluation exige un checkpoint et n'entraîne pas les réseaux. Elle retient
 uniquement les épisodes dont toutes les transitions proviennent de la politique
-évaluée et arrête le comptage après 200 épisodes admissibles par défaut :
+évaluée et arrête le comptage après 200 épisodes sportifs par défaut
+(`goal_scored`, `goal_conceded` ou `timeout`) :
 
 ```powershell
 python -m football_rl.ppo_unity --resume checkpoints/ppo_bot_reference_01/latest.pt --evaluate
@@ -158,7 +162,29 @@ python -m football_rl.ppo_unity --resume checkpoints/ppo_bot_reference_01/latest
 
 Modifier la cible avec `--evaluation-episodes`. Les épisodes exclus pour
 interruption technique sont signalés séparément et ne sont pas comptés comme
-des défaites.
+des défaites. Les autres issues (`interrupted`, `match_over`, `disabled`, etc.)
+ne font pas avancer la cible. La console distingue les épisodes sportifs des
+épisodes complets reçus ; l'axe TensorBoard correspond au nombre d'épisodes
+sportifs, et les statistiques sont cumulées sur ces épisodes.
+Pendant l'évaluation, la console affiche aussi, pour chaque
+agent et chaque batch, les moyennes prédites de `move_x`/`move_z`, leurs bornes,
+l'écart-type de la politique et les proportions d'actions Unity dépassant
+`-1` ou `1`. Elle compare également la norme de la commande horizontale après
+le bornage Unity à la vitesse horizontale observée dans `next_obs` (convertie
+avec `velocityScale = 6`), ainsi que les proportions de transitions
+`self_stunned`, `self_tackling` et `self_grounded`. Les probabilités prédites
+de tacle et de saut sont comparées aux commandes binaires effectivement tirées.
+Les transitions où le joueur est libre de marcher donnent aussi la commande et
+la vitesse moyennes ; l'alignement entre la commande et la direction du ballon
+est affiché séparément, en excluant les vecteurs presque nuls. Les issues
+sportives inconnues sont exclues du bilan principal mais comptées à part.
+
+Pour isoler le déplacement des effets du tacle et du saut, lancer l'évaluation
+avec `--diagnostic-no-jump-tackle`. Cette option n'est disponible qu'avec
+`--evaluate` : elle annule les poids des sorties tacle et saut dans
+l'acteur en mémoire et fixe leurs biais à `-20` avant l'export. Leur probabilité
+d'activation devient ainsi proche de zéro. Le checkpoint
+original n'est pas modifié, et cette variante n'est ni entraînée ni sauvegardée.
 
 ### Ouvrir TensorBoard
 
@@ -177,8 +203,9 @@ que Unity joue et afficher les fichiers après l'arrêt de Python.
    `checkpoint_test_reprise`. Une reprise est une continuation, pas un essai indépendant.
 2. Dans **Scalars** ou **Time Series**, afficher les groupes `episodes`, `ppo`,
    `loss` et `exploration`.
-3. Choisir **Step** comme axe horizontal : ici, c'est le total de transitions
-   utilisées pour l'apprentissage, ni le nombre d'époques ni le nombre de parties.
+3. Choisir **Step** comme axe horizontal : pendant l'entraînement, c'est le total
+   de transitions utilisées pour l'apprentissage. Pendant l'évaluation, c'est le
+   nombre d'épisodes sportifs retenus.
 4. Commencer avec **Smoothing = 0**, puis essayer un lissage modéré, par exemple
    0,5, pour voir une tendance. Revenir aux points bruts pour contrôler les pics.
 5. L'onglet **Text** contient la configuration enregistrée au lancement.
@@ -608,6 +635,9 @@ de collecte dans la mémoire GPU.
 | `--device` | `cpu` | Périphérique PyTorch : `cpu` ou `cuda[:index]` |
 | `--seed` | 0 | Initialisation et RNG PyTorch, sans piloter le RNG Unity |
 | `--collect-only` | désactivé | Diagnostic sans mise à jour des réseaux |
+| `--evaluate` | désactivé | Évalue un checkpoint sans entraînement |
+| `--evaluation-episodes` | 200 | Nombre d'épisodes sportifs à évaluer (but marqué, encaissé ou timeout) |
+| `--diagnostic-no-jump-tackle` | désactivé | Désactive tacle et saut pendant une évaluation |
 | `--resume` | aucun | Checkpoint à restaurer au démarrage |
 | `--checkpoint-dir` | `checkpoints/<run_name>` | Dossier des sauvegardes |
 | `--log-dir` | `runs` | Racine des événements TensorBoard ; le nom du run est ajouté |
