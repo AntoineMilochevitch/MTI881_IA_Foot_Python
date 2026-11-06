@@ -17,18 +17,22 @@ Le [README général](README.md) précise les observations/actions et le
 | PPO-Clip, optimiseurs séparés, mini-lots et arrêt KL | Implémentés |
 | Collecte → entraînement → export → accusé de réception | Raccordés dans `PPOUnityTrainer` |
 | Contrôle des log-probabilités Python/Unity | À chaque lot retenu, avant entraînement |
-| Tests versionnés | Sauvegarde/restauration du critique et d'Adam, journalisation TensorBoard |
+| Tests versionnés | Checkpoints, TensorBoard, évaluation, shaping et cycle PPO avec récompenses transformées |
 | Validation dans une partie Unity réelle | Collecte, entraînement CUDA et reprise après redémarrage vérifiés |
 | Checkpoints | Sauvegarde après chaque cycle et archives tous les dix cycles |
 | TensorBoard | Métriques d'apprentissage et résumés d'épisodes enregistrés |
 | Adversaire `SimpleBotInput` | Configuration réseau contre bot utilisée dans Unity |
 | Évaluation à politique figée | `--evaluate` avec reprise d'un checkpoint |
+| Shaping joueur–ballon | Potentiel optionnel côté Python, avant le GAE, sauvegardé dans les checkpoints |
+| Suivi de l'approche | Distance et occasions de frappe ; aucun comptage de contacts physiques |
 
 La boucle d'apprentissage est désormais exécutable. Unity produit les
 observations, joue les actions, calcule les récompenses et transmet les
 transitions. Python conserve l'acteur, le critique et leurs optimiseurs,
 entraîne les réseaux puis renvoie l'acteur et son décodeur. Le moteur et le
 protocole Unity ne sont pas modifiés.
+Python peut également ajouter le shaping décrit ci-dessous aux récompenses
+utilisées pour apprendre. Les retours d'épisodes reçus d'Unity restent séparés.
 
 ### Installation et premier diagnostic
 
@@ -98,6 +102,151 @@ Pour afficher toutes les options :
 ```powershell
 python -m football_rl.ppo_unity --help
 ```
+
+### Apprendre à rejoindre le ballon : potential-based reward shaping
+
+L'objectif de cet essai solo est de fournir un signal exploitable avant le
+premier contact. Une récompense fondée sur le mouvement du ballon reste nulle
+tant que celui-ci est immobile ; le potentiel joueur–ballon varie déjà quand
+le joueur se déplace. Ce mécanisme est dans `ppo_shaping.py`, avec des commentaires
+sur les cas terminaux, les unités et les mesures disponibles.
+
+#### Préparer et lancer l'essai
+
+Dans la scène solo, conserver les apparitions aléatoires et désactiver le
+GameObject de l'adversaire. Sur le `FootAgent` du joueur actif, mettre
+**Rewards → Distance To Ball Per Second = 0**. Le nouveau terme remplace ainsi
+la pénalité permanente de distance, au lieu de se cumuler avec elle. Conserver
+les autres récompenses et les paramètres PPO pour ce premier essai.
+
+Ce réglage Unity est nécessaire : le pont transmet une récompense totale,
+sans son détail par composante. Python ne peut ni vérifier ce coefficient
+dans le `hello`, ni soustraire exactement une pénalité intégrée à chaque pas
+physique. Les options Python ne changent pas les réglages de la scène.
+
+Arrêter l'ancien processus Python et le mode Play, puis lancer un nouveau run :
+
+```powershell
+python -m football_rl.ppo_unity --device cuda --rollout-size 512 --ball-approach-shaping 0.1 --run-name solo_random_pbrs_01 --verbose
+```
+
+Lancer ensuite Play. L'absence de `--resume` initialise de nouveaux réseaux et
+optimiseurs. `0.1` est un coefficient de départ expérimental, pas une valeur
+validée. Sans cette option, le coefficient vaut **0**, donc les récompenses
+ne sont pas transformées. Les métriques d'approche restent disponibles lorsque
+les observations correspondantes existent.
+
+#### Formule et place dans PPO
+
+Les observations `ball_rel_x` et `ball_rel_z` sont déjà normalisées par le
+`positionScale` Unity. Le potentiel ignore la hauteur :
+
+```text
+d(s) = sqrt(ball_rel_x² + ball_rel_z²)
+Phi(s) = -d(s)
+F(s, s') = alpha × [gamma × Phi(s') - Phi(s)]
+reward_training = reward_unity + F(s, s')
+```
+
+Les indices sont résolus à partir des noms d'observations, pas de positions
+fixes dans le vecteur. Garder `positionScale` identique entre essais : changer
+cette échelle modifie aussi l'intensité du shaping.
+
+Avec `alpha = 0.1`, `gamma = 0.99` et une distance normalisée initiale de 0.5 :
+
+| Distance suivante (transition non terminale) | Shaping ajouté |
+| --- | ---: |
+| 0.4 : rapprochement | +0.0104 |
+| 0.5 : immobilité | +0.0005 |
+| 0.6 : éloignement | -0.0094 |
+
+Le petit terme positif à l'arrêt vient de l'actualisation : ce n'est pas
+exactement une différence de distances. Ne pas le supprimer ni borner les
+contributions négatives indépendamment, au risque de perdre la structure du
+potentiel. Sur une trajectoire complète terminée, les contributions actualisées
+se compensent et leur somme vaut `-alpha × Phi(s_initial)` ; elle ne dépend
+pas des détours. Cette propriété concerne l'ajout au signal de base choisi,
+pas la suppression d'autres récompenses ni une garantie de convergence de PPO.
+
+Le chemin des données est :
+
+```text
+batch Unity → filtrage de version → contrôle des log-probabilités
+            → ajout du shaping sur les copies CPU
+            → valeurs du critique → GAE → cibles et avantages → optimisation PPO
+```
+
+Chaque transition utilise son propre couple `(obs, next_obs)`. Aucune différence
+n'est calculée entre deux lignes voisines : elles peuvent appartenir à des
+agents ou épisodes différents. Le shaping est appliqué **une seule fois**, à
+la réception du chunk, et non à chaque époque. Il utilise le `gamma` de PPO par
+décision enregistrée, sans facteur `dt` supplémentaire.
+
+- **But (`terminated=True`)** : le potentiel de l'état terminal est fixé à zéro,
+  y compris pour un but encaissé. La récompense de but originale est conservée.
+- **Timeout/interruption (`truncated=True`)** : conserver le potentiel de
+  `next_obs`, comme le bootstrap du critique. Le GAE coupe néanmoins sa récurrence.
+- **Fin de batch/rollout** : conserver aussi le potentiel suivant ; ce n'est
+  pas une fin de partie.
+- **Repositionnement** : utiliser l'observation finale capturée par Unity avant
+  le reset, jamais l'observation initiale de la manche suivante.
+
+Le critique apprend désormais la valeur des récompenses transformées. On ne
+change ni l'acteur, ni le clipping, ni la loss du critique pour cette expérience.
+
+#### TensorBoard : regarder le comportement, pas seulement le shaping
+
+| Courbe | Interprétation |
+| --- | --- |
+| `approach/distance_mean_normalized` | Distance horizontale moyenne joueur–ballon sur les observations retenues ; plus faible signifie plus proche |
+| `approach/distance_decrease_mean_normalized` | Moyenne de `d(obs) - d(next_obs)` ; positive si le joueur et le ballon se rapprochent en moyenne |
+| `approach/can_kick_fraction` | Fraction des observations retenues où le ballon est dans la zone de frappe |
+| `approach/complete_sporting_episodes` | Nombre d'épisodes sportifs entièrement observés depuis le dernier cycle, pour interpréter les proportions |
+| `approach/incomplete_sporting_episodes` | Épisodes exclus des mesures d'approche pour début manquant, trou ou doublon |
+| `approach/episodes_with_kick_opportunity_fraction` | Proportion des épisodes sportifs complets ayant au moins une occasion de frappe observée |
+| `approach/first_kick_opportunity_step_mean` | Nombre moyen de décisions avant la première occasion, uniquement parmi les épisodes qui en ont une |
+| `reward/environment_mean` | Récompense Unity moyenne par transition retenue |
+| `reward/shaping_mean`, `reward/shaping_abs_mean` | Contribution signée et amplitude moyenne du shaping |
+| `reward/training_mean` | Récompense moyenne effectivement utilisée par le GAE |
+
+Les deux dernières métriques d'épisode ne reçoivent pas de point lorsque leur
+dénominateur est nul. Ne pas interpréter une absence de point comme un zéro.
+Le tracker conserve les épisodes à travers les batches et les changements de
+version, et repart à zéro à la reconnexion. Ces métriques d'épisode peuvent donc
+couvrir plusieurs versions de politique ; les moyennes du rollout ne concernent
+que les transitions acceptées de la version courante. L'axe reste le nombre
+de transitions entraînées.
+
+`self_can_kick` indique une **occasion de frappe, pas un contact réel**. Le pont
+ne transmet pas les événements de contact ; un contact entre deux observations
+peut être manqué. Le délai est exprimé en décisions, car le pas de temps physique
+n'est pas transmis. Avec 5 pas de physique à 0.02 s par décision, 10 décisions
+correspondent à environ une seconde simulée.
+
+`episodes/return_mean` conserve le retour brut annoncé par Unity, sans shaping
+Python. Une hausse de `reward/shaping_mean` ne démontre pas un progrès sportif.
+Comparer aussi les buts, les timeouts, les occasions de frappe et leurs effectifs.
+Le retrait de l'ancienne pénalité modifie le retour Unity : ne pas attribuer
+automatiquement une hausse de ce retour à un meilleur comportement.
+
+#### Reprise et évaluation
+
+```powershell
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/solo_random_pbrs_01/latest.pt --run-name solo_random_pbrs_01
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/solo_random_pbrs_01/latest.pt --evaluate --evaluation-episodes 200 --run-name eval_solo_random_pbrs_01
+```
+
+Le coefficient est sauvegardé dans la configuration du checkpoint. Une reprise
+le restaure automatiquement ; un ancien checkpoint qui ne possède pas ce champ
+utilise 0. Une demande explicite de coefficient différent avec `--resume` est
+refusée, car elle changerait la cible du critique et l'objectif de l'expérience.
+Pour cet essai, partir sans `--resume` avec un nouveau nom.
+
+L'évaluation n'applique pas le shaping et ne met aucun réseau à jour : ses
+résultats et retours sont ceux d'Unity. Les nouvelles métriques `approach/*`
+sont destinées au suivi d'entraînement ; les métriques sportives habituelles
+restent celles à comparer lors des évaluations. Le mode `--collect-only` peut
+contrôler le calcul du shaping sans optimiser, mais n'écrit pas TensorBoard.
 
 ### Sauvegarder et reprendre
 
@@ -309,6 +458,7 @@ Le collecteur commun `football_rl.unity` reste indépendant de l'algorithme.
 | `ppo_trainer.py` | Configuration, callbacks, état de la connexion et cycle d'apprentissage |
 | `ppo_unity.py` | Arguments de lancement et branchement des callbacks de `iafoot.TrainingServer` |
 | `ppo_checkpoint.py` | Construction, écriture, validation et restauration des checkpoints |
+| `ppo_shaping.py` | Potentiel joueur–ballon et mesures des occasions de frappe |
 | `ppo_logging.py` | Configuration et métriques envoyées à TensorBoard |
 
 Les fichiers d'algorithme et ce document appartiennent au travail PPO ;
@@ -625,6 +775,7 @@ de collecte dans la mémoire GPU.
 | `--num-epochs` | 4 | Nombre maximal de passages sur un rollout |
 | `--actor-lr`, `--critic-lr` | 0.0003 | Taux d'apprentissage des deux Adam |
 | `--gamma` | 0.99 | Actualisation des récompenses par décision enregistrée |
+| `--ball-approach-shaping` | 0 | Coefficient du potentiel joueur–ballon ; conservé à la reprise |
 | `--gae-lambda` | 0.95 | Pondération de la récurrence GAE |
 | `--clip-epsilon` | 0.2 | Clipping du ratio PPO |
 | `--max-grad-norm` | 0.5 | Norme maximale des gradients de chaque réseau |
@@ -660,6 +811,9 @@ Les fichiers présents dans `tests/` couvrent :
   avec vérification d'un paramètre et de son historique Adam ;
 - `test_ppo_logging.py` : écriture et relecture des événements TensorBoard,
   agrégation des épisodes et comportement du suivi.
+- `test_ppo_shaping.py` : identité télescopique du potentiel, terminaisons et
+  troncatures, insertion avant le GAE, filtrage de version, configuration de
+  reprise et suivi des occasions de frappe sur plusieurs batches.
 
 Des vérifications ponctuelles ont également couvert un cycle simulé,
 la reprise avec une mise à jour identique sur CPU à données et RNG identiques,
@@ -670,10 +824,10 @@ ne démontrent pas une amélioration du niveau de jeu.
 
 ## 12. Suite du travail
 
-La priorité actuelle est de prolonger l'expérience contre le même bot, en
-conservant PPO, les hyperparamètres, les récompenses, la scène et les réglages du
-bot. Le rollout de l'essai repris reste à 512. La continuation doit utiliser
-`--resume` après un arrêt de Python ; si le processus tourne déjà, le laisser continuer.
+La priorité actuelle est de comparer l'essai solo à départs aléatoires avec
+l'essai de shaping joueur–ballon décrit plus haut. Conserver les anciens runs,
+le même placement aléatoire et les hyperparamètres PPO ; distinguer les noms
+d'expériences et noter le retrait de la pénalité de distance Unity.
 
 Se donner des points de contrôle vers **10 000, 50 000 et 100 000 transitions
 entraînées au total**, en sautant un palier déjà dépassé. Ce sont des repères
@@ -694,10 +848,11 @@ bloquée demandent un diagnostic immédiat, pas davantage de temps d'entraîneme
 
 Après cette phase de référence :
 
-1. Construire une évaluation à politique figée, avec le même bot et des côtés alternés.
+1. Utiliser l'évaluation à politique figée, avec le même bot et des côtés alternés.
    Les courbes de collecte servent au suivi, pas à une comparaison contrôlée.
 2. Si les contacts et résultats restent rares sans tendance favorable, étudier
-   un apprentissage progressif : adversaire immobile, variante plus lente,
-   puis bot normal. Garder le bot de référence inchangé pour l'évaluation.
+   un apprentissage progressif : distance initiale joueur–ballon limitée puis
+   élargie, avant d'ajouter un adversaire. Garder le bot de référence inchangé
+   pour l'évaluation. `Minimum Distance` n'est pas une limite maximale.
 3. Étudier ensuite les améliorations RL de [TODO_PPO.md](TODO_PPO.md), une idée
    à la fois : exploration, critique, représentation, tâches auxiliaires, etc.

@@ -44,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--actor-lr", type=float, default=defaults.actor_lr)
     parser.add_argument("--critic-lr", type=float, default=defaults.critic_lr)
     parser.add_argument("--gamma", type=float, default=defaults.gamma)
+    # None permet de distinguer une option absente d'un zéro explicitement
+    # demandé, afin de ne pas changer silencieusement la récompense à la reprise.
+    parser.add_argument("--ball-approach-shaping", type=float, default=None,
+                        help="coefficient du potentiel joueur-ballon (défaut : 0 ; reprise : valeur sauvegardée)")
     parser.add_argument("--gae-lambda", dest="lambda_", type=float, default=defaults.lambda_)
     parser.add_argument("--clip-epsilon", type=float, default=defaults.clip_epsilon)
     parser.add_argument("--max-grad-norm", type=float, default=defaults.max_grad_norm)
@@ -110,10 +114,19 @@ def main(argv: list[str] | None = None) -> None:
             config_values = {
                 field.name: getattr(args, field.name) for field in fields(PPOTrainerConfig)
             }
+            config_values["ball_approach_shaping"] = (
+                args.ball_approach_shaping if args.ball_approach_shaping is not None else 0.0
+            )
         else:
             saved_config = resume_checkpoint["config"]
             if not isinstance(saved_config, dict):
                 raise ValueError("La configuration du checkpoint doit être un dictionnaire.")
+            saved_shaping = saved_config.get("ball_approach_shaping", 0.0)
+            if args.ball_approach_shaping is not None and args.ball_approach_shaping != saved_shaping:
+                raise ValueError(
+                    "--resume conserve le shaping sauvegardé. Pour changer "
+                    "--ball-approach-shaping, démarrer un nouvel entraînement sans --resume."
+                )
             config_values = saved_config.copy()
             config_values.update({
                 "device": args.device,
@@ -154,7 +167,16 @@ def main(argv: list[str] | None = None) -> None:
     )
     if resume_checkpoint is not None:
         logging.getLogger(__name__).info(
-            "Reprise : les réglages sauvegardés sont utilisés, sauf device, log_dir et collect_only."
+            "Reprise : réglages sauvegardés utilisés, sauf device, log_dir, collect_only, evaluate et evaluation_episodes."
+        )
+    if config.ball_approach_shaping > 0:
+        logging.getLogger(__name__).info(
+            "Shaping joueur-ballon : alpha=%g, gamma=%g. %s "
+            "Pour remplacer la pénalité de distance Unity, régler Distance To Ball Per Second à 0 "
+            "sur les FootAgent entraînés (ce réglage n'est pas transmis par le pont).",
+            config.ball_approach_shaping, config.gamma,
+            "Évaluation : récompenses Unity uniquement." if config.evaluate
+            else "Appliqué aux transitions avant le GAE.",
         )
     if args.diagnostic_no_jump_tackle:
         logging.getLogger(__name__).info(

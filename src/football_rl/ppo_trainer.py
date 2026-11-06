@@ -28,6 +28,7 @@ from football_rl.ppo_network import PPOActorNetwork, PPOValueNetwork
 from football_rl.ppo_training import compute_policy_metrics, train_ppo
 from football_rl.unity import ACTION_SCHEMA
 from football_rl.ppo_logging import PPOTensorBoardLogger
+from football_rl.ppo_shaping import BallApproachShaper, KickOpportunityTracker
 
 CONTINUOUS_STD_NAMES = ("move_x", "move_z", "shoot_power", "shoot_curve")
 logger = logging.getLogger(__name__)
@@ -57,8 +58,18 @@ class PPOTrainerConfig:
     log_dir: str | None = None
     evaluate: bool = False
     evaluation_episodes: int = 200
+    # 0 préserve les anciens runs. Cette valeur est enregistrée avec le critique,
+    # qui apprend V de la récompense transformée, et avec les optimiseurs.
+    ball_approach_shaping: float = 0.0
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.ball_approach_shaping, bool)
+            or not isinstance(self.ball_approach_shaping, (int, float))
+            or not math.isfinite(self.ball_approach_shaping)
+            or self.ball_approach_shaping < 0
+        ):
+            raise ValueError("ball_approach_shaping doit être un nombre fini >= 0.")
         if not self.behavior.strip():
             raise ValueError("behavior ne doit pas être vide.")
         for name, minimum in (
@@ -127,6 +138,8 @@ class PPOUnityTrainer:
 
         self.critic_optimizer = None
         self.schema = None
+        self.ball_shaper = None
+        self.approach_tracker = None
         self.connection = None
         self.session_id = None
         self.version_counter = 0
@@ -274,10 +287,27 @@ class PPOUnityTrainer:
             # Une erreur nécessite une déconnexion/reconnexion explicite.
             if self.phase == "error":
                 return
+            # Les indices sont résolus par nom, jamais par une position supposée
+            # dans les 46 observations. Un vieux schéma peut rester utilisable
+            # sans shaping ; activer le shaping exige les deux coordonnées.
+            has_ball_coordinates = all(
+                observation_names.count(name) == 1
+                for name in BallApproachShaper.REQUIRED_NAMES
+            )
+            self.ball_shaper = (
+                BallApproachShaper(
+                    observation_names, self.config.gamma, self.config.ball_approach_shaping
+                )
+                if has_ball_coordinates or self.config.ball_approach_shaping > 0 else None
+            )
+            self.approach_tracker = KickOpportunityTracker(observation_names)
             if self.actor is None:
                 pending_checkpoint = self.pending_checkpoint
                 if pending_checkpoint is not None:
                     validate_schema(pending_checkpoint, schema)
+                    saved_shaping = pending_checkpoint["config"].get("ball_approach_shaping", 0.0)
+                    if saved_shaping != self.config.ball_approach_shaping:
+                        raise ValueError("La reprise doit conserver le coefficient de shaping du checkpoint.")
                 with torch.random.fork_rng(devices=[]):
                     # Initialisation CPU sans modifier le RNG CUDA de l'appelant.
                     torch.random.default_generator.manual_seed(self.seed)
@@ -636,6 +666,16 @@ class PPOUnityTrainer:
         if self.config.evaluate:
             self._on_evaluation_batch(connection, batch)
             return
+        # Mesures descriptives sur les épisodes complets, y compris les rares
+        # transitions d'anciennes versions rejetées par le buffer on-policy.
+        # Leur collecte ne change ni les récompenses ni le filtrage PPO.
+        if self.tb_logger is not None and self.approach_tracker is not None:
+            try:
+                PPORolloutBuffer._validate_shapes(batch, self.schema[0])
+                self.approach_tracker.observe(batch)
+            except Exception:
+                self.approach_tracker = KickOpportunityTracker(self.schema[1])
+                logger.warning("Suivi de l'approche réinitialisé : batch invalide.", exc_info=True)
         if self.tb_logger is not None:
             # Séparé du filtrage du buffer PPO : ces épisodes sont déjà terminés même si les transitions du lot sont ignorées.
             try:
@@ -653,6 +693,10 @@ class PPOUnityTrainer:
                 return
             # add_batch a déjà copié et filtré ces données sur CPU.
             self._check_parity(self.buffer.chunks[-1])
+            if self.config.ball_approach_shaping > 0:
+                # Une seule application à la réception, avant le GAE et toutes
+                # les époques PPO. Les résumés d'épisodes Unity restent bruts.
+                self.buffer.chunks[-1] = self.ball_shaper.apply(self.buffer.chunks[-1])
             logger.debug(
                 "Batch %d : %d/%d transitions retenues, buffer=%d, "
                 "écart logp max=%.3g, ratio moyen=%.6f.",
@@ -710,6 +754,7 @@ class PPOUnityTrainer:
 
         self.buffer = None
         self.connection = None
+        self.approach_tracker = None
         self.session_id = None
         self.pending_version = None
         self.active_version = None
@@ -729,6 +774,10 @@ class PPOUnityTrainer:
                 "data/ignored_transitions_total": self.ignored_transitions,
                 "parity/max_log_prob_error": self.rollout_max_log_prob_error,
             }
+            if self.ball_shaper is not None:
+                extras.update(self.ball_shaper.metrics(self.buffer.get_data()))
+            if self.approach_tracker is not None:
+                extras.update(self.approach_tracker.pop_metrics())
             if self.collection_started_at is not None:
                 extras["time/collection_s"] = optimization_started_at - self.collection_started_at
             # Exploration : écarts-types réellement utilisés (log_std borné puis exponentié).
