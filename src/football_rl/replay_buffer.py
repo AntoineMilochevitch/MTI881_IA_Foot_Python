@@ -89,3 +89,4 @@ class ReplayBuffer:
             next_observations=torch.from_numpy(self._next_observations[indices]).to(device),
             terminated=torch.from_numpy(self._terminated[indices]).to(device),
         )
+
