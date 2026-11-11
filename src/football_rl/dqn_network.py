@@ -50,3 +50,4 @@ class DQNNetwork(FootballNetwork):
             Dictionnaire avec ``"q_values"`` de forme ``(batch, num_actions)``.
         """
         return {"q_values": self.layers(observations)}
+
