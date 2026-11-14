@@ -180,6 +180,32 @@ python -m football_rl.ppo_unity --device cuda --resume checkpoints/snapshots/adv
 
 Avec 32 terrains en 1 contre 1, attendre deux comportements et 64 agents dans `hello`, puis des batchs `Foot` seulement. Une fois le diagnostic validé, retirer `--collect-only` et choisir un nouveau nom de run pour l'entraînement avec ces nouveaux départs.
 
+### Mélange d'adversaires : 16 bots + 8 anciennes snapshots + 8 récentes
+
+Un seul acteur et un seul critique apprennent à partir des **32 joueurs bleus `Foot`**. Les rouges restent fixes : 16 `SimpleBotInput`, 8 `FootSnapshotOld` et 8 `FootSnapshotRecent`. Les adversaires n'enregistrent aucune transition. C'est un mélange fixe, pas une ligue avec remplacement automatique des adversaires.
+
+Dans Unity, arrêter Play puis utiliser **IA Foot > Entraînement parallèle > Configurer le mélange 16 bots + 8 anciennes + 8 récentes**. La scène source doit avoir un joueur actif dans chaque équipe, chacun avec un `FootAgent` configuré. Sauvegarder la scène. Le menu active `ArenaOpponentMix`, impose 32 terrains et conserve les réglages de récompenses et d'apparitions. À chaque Play, les contrôleurs et comportements sont affectés automatiquement avant leur inscription au pont.
+
+Une copie figée du modèle à **9 263 696 transitions** est disponible dans `checkpoints/snapshots/mix_recent_9263696.pt`. Elle sert à la fois de point de départ pour l'apprenant et d'adversaire récent ; seule la copie apprenante évolue. L'ancien adversaire reste `adversaire_v1.pt`. Ces fichiers locaux sont ignorés par Git.
+
+```powershell
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/snapshots/mix_recent_9263696.pt --opponent FootSnapshotOld checkpoints/snapshots/adversaire_v1.pt --opponent FootSnapshotRecent checkpoints/snapshots/mix_recent_9263696.pt --run-name mixed_opponents_01
+```
+
+Pour vérifier le pont avant d'entraîner, ajouter `--collect-only --verbose`. Attendre **3 comportements, 48 agents** dans le `hello` (les 16 bots ne sont pas des `FootAgent` actifs), les deux confirmations de snapshots, puis celle de l'apprenant et une collecte valide. Retirer `--collect-only` pour entraîner. Les anciennes options `--opponent-checkpoint` et `--opponent-behavior` restent utilisables pour une seule snapshot ; elles ne se combinent pas avec `--opponent`.
+
+À la reprise, remplacer uniquement le chemin de `--resume` par `checkpoints/mixed_opponents_01/latest.pt`, conserver le nom du run et **répéter les deux mêmes options `--opponent`**. Ne pas remplacer la snapshot récente par le dernier checkpoint de l'apprenant : cela changerait l'adversaire de l'expérience. Les hyperparamètres, dont l'entropie `0,001`, sont conservés.
+
+Dans TensorBoard, consulter séparément :
+
+- `opponents/bot/sport/*`
+- `opponents/snapshot_old/sport/*`
+- `opponents/snapshot_recent/sport/*`
+
+Chaque groupe expose `count`, `goal_scored_fraction`, `goal_conceded_fraction` et `timeout_fraction`, ainsi que son retour et sa durée dans `episodes/*`. Les interruptions restent exclues du bilan sportif. Un lot sans épisode terminé pour un groupe n'ajoute pas de point pour ce groupe. Pondérer les taux par `sport/count` pour comparer des périodes : 50/25/25 % des terrains n'implique pas 50/25/25 % des épisodes, dont les durées diffèrent.
+
+Pour revenir à une évaluation contre un seul adversaire, **désactiver `ArenaOpponentMix` hors Play**, puis configurer la scène comme indiqué plus haut. Les évaluations sur le mélange sont possibles, mais `--evaluation-episodes 500` compte alors 500 épisodes sportifs au total, pas 500 par adversaire. Garder une évaluation séparée contre une référence fixe.
+
 ### Démarrer de zéro
 
 Depuis le dépôt Python, avec les dépendances et le pont installés :
@@ -288,6 +314,7 @@ Tous ces fichiers sont dans `src/football_rl/` :
 | --- | --- |
 | `ppo_network.py` | Acteur, critique, tirage des actions et log-probabilités |
 | `ppo_export.py` | Export de l'acteur et du décodeur vers Unity |
+| `ppo_opponent.py` | Snapshots figées et attente de tous leurs accusés avant l'apprenant |
 | `ppo_buffer.py` | Stockage et reconstruction des trajectoires |
 | `ppo_return.py` | Avantages GAE et cibles du critique |
 | `ppo_training.py` | Losses, mises à jour et arrêt KL |

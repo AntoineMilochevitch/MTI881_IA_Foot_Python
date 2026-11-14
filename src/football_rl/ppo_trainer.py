@@ -175,6 +175,7 @@ class PPOUnityTrainer:
         ] = {}
         self.evaluation_technical_interruptions = 0
         self.evaluation_other_outcomes: Counter[str] = Counter()
+        self.agent_opponent_groups: dict[int, str] = {}
         self.tb_logger = None
         if config.log_dir is not None and not config.collect_only:
             self.tb_logger = PPOTensorBoardLogger(config.log_dir, config)
@@ -266,6 +267,11 @@ class PPOUnityTrainer:
                 (item["name"], item["type"])
                 for item in behavior["actions"]
             )
+            # Métadonnées facultatives : les anciennes scènes restent compatibles.
+            self.agent_opponent_groups = {
+                int(agent["id"]): str(agent.get("opponent_group", ""))
+                for agent in behavior.get("agents", [])
+            }
             observation_size = int(behavior["obs_size"])
             observation_names = tuple(behavior["obs_names"])
             decision_period = int(behavior["decision_period"])
@@ -425,7 +431,7 @@ class PPOUnityTrainer:
                 self.evaluation_admissible_count += 1
                 outcome = str(summary["outcome"])
                 if outcome in {"goal_scored", "goal_conceded", "timeout"}:
-                    self.evaluation_episodes.append(dict(summary))
+                    self.evaluation_episodes.append(self._with_opponent_group(summary))
                 else:
                     self.evaluation_other_outcomes[outcome] += 1
                 if len(self.evaluation_episodes) >= self.config.evaluation_episodes:
@@ -436,6 +442,7 @@ class PPOUnityTrainer:
             if self.tb_logger is not None and self.evaluation_episodes:
                 step = sporting_count
                 self.tb_logger.log_episodes(step, self.evaluation_episodes)
+                self.tb_logger.log_opponent_episodes(step, self.evaluation_episodes)
                 self.tb_logger.log_evaluation_interruptions(
                     step, self.evaluation_technical_interruptions
                 )
@@ -697,6 +704,9 @@ class PPOUnityTrainer:
             self.rollout_max_log_prob_error, self.last_parity["max_log_prob_error"]
         )
 
+    def _with_opponent_group(self, summary) -> dict:
+        return dict(summary, opponent_group=self.agent_opponent_groups.get(int(summary["agent_id"]), ""))
+
     def on_batch(self, connection: UnityConnection, batch: Batch) -> None:
         """Garde uniquement la version acquittée, puis déclenche un cycle PPO."""
         if connection is not self.connection or batch.behavior != self.behavior:
@@ -717,7 +727,10 @@ class PPOUnityTrainer:
         if self.tb_logger is not None:
             # Séparé du filtrage du buffer PPO : ces épisodes sont déjà terminés même si les transitions du lot sont ignorées.
             try:
-                self.episode_summaries.extend(getattr(batch, "episodes", None) or ())
+                self.episode_summaries.extend(
+                    self._with_opponent_group(summary)
+                    for summary in (getattr(batch, "episodes", None) or ())
+                )
             except Exception:
                 logger.warning("Suivi TensorBoard : résumés d'épisodes ignorés", exc_info=True)
         if self.phase != "collecting":
@@ -840,6 +853,7 @@ class PPOUnityTrainer:
 
             self.tb_logger.log_cycle(step, self.last_history, extras)
             self.tb_logger.log_episodes(step, list(self.episode_summaries))
+            self.tb_logger.log_opponent_episodes(step, list(self.episode_summaries))
             self.episode_summaries.clear()
         except Exception:
             # Le suivi est secondaire : on ne met jamais le trainer en erreur pour lui.

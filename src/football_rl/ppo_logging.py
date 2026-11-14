@@ -71,7 +71,7 @@ class PPOTensorBoardLogger:
         except Exception:
             logger.warning("Suivi TensorBoard : cycle non enregistré.", exc_info=True)
 
-    def log_episodes(self, step: int, episodes: list[dict[str, Any]]) -> None:
+    def log_episodes(self, step: int, episodes: list[dict[str, Any]], prefix: str = "") -> None:
         """Agrège les résumés d'épisodes terminés pendant la collecte"""
         try:
             if not episodes:
@@ -97,9 +97,20 @@ class PPOTensorBoardLogger:
             if sporting_count:
                 for outcome in sporting_outcomes:
                     scalars[f"sport/{outcome}_fraction"] = outcomes[outcome] / sporting_count
-            self._write(step, scalars)
+            self._write(step, {prefix + tag: value for tag, value in scalars.items()})
         except Exception:
             logger.warning("Suivi TensorBoard : épisodes non enregistrés.", exc_info=True)
+
+    def log_opponent_episodes(self, step: int, episodes: list[dict[str, Any]]) -> None:
+        """Même bilan, séparé selon l'adversaire annoncé dans le hello Unity.
+
+        Le nombre de terrains fixe la répartition des transitions, pas celle
+        des épisodes : un adversaire qui finit vite produit plus de résultats.
+        Ne pas moyenner les taux par lot sans les pondérer par sport/count.
+        """
+        for group in ("bot", "snapshot_old", "snapshot_recent"):
+            selected = [e for e in episodes if e.get("opponent_group") == group]
+            self.log_episodes(step, selected, prefix=f"opponents/{group}/")
 
     def log_evaluation_interruptions(self, step: int, count: int) -> None:
         """Enregistre séparément les épisodes exclus pour interruption technique."""

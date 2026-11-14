@@ -1,3 +1,6 @@
+"""Snapshots figées et synchronisation de leur installation avant PPO."""
+
+import logging
 import torch
 from iafoot import UnityConnection
 
@@ -31,6 +34,8 @@ class FrozenOpponent:
         return export_actor(self.actor)
 
     def validate_behavior(self, behavior: dict[str, object]) -> None:
+        if any(agent.get("record_experience") is True for agent in behavior.get("agents", [])):
+            raise ValueError(f"Désactiver Record Experience sur les adversaires {self.behavior!r}.")
         observation_size = int(behavior["obs_size"])
         observation_names = tuple(behavior["obs_names"])
         actions = tuple(
@@ -110,3 +115,68 @@ class FrozenOpponent:
             self.connection = None
             self.pending_version = None
             self.ready = False
+
+
+class FrozenOpponentPool:
+    """Plusieurs politiques adverses, mais un seul trainer apprenant.
+
+    Chaque comportement est installé une fois par connexion. L'apprenant
+    n'est envoyé qu'après TOUS les accusés, même s'ils arrivent dans le désordre.
+    Les mises à jour PPO suivantes ne remplacent jamais ces snapshots.
+    """
+
+    def __init__(self, opponents: list[FrozenOpponent], trainer) -> None:
+        names = [opponent.behavior for opponent in opponents]
+        if len(set(names)) != len(names) or any(
+            not name.strip() or name == "*" or name == trainer.behavior for name in names
+        ):
+            raise ValueError("Les comportements adverses doivent être distincts entre eux et de l'apprenant.")
+        self.opponents = opponents
+        self.trainer = trainer
+        self.connection = None
+
+    @property
+    def ready(self) -> bool:
+        return all(opponent.ready for opponent in self.opponents)
+
+    def on_connect(self, connection: UnityConnection) -> None:
+        if self.connection is not None and self.connection is not connection:
+            raise RuntimeError("Une autre connexion utilise déjà les adversaires.")
+        announced = {item['name']: item for item in connection.behaviors}
+        missing = {self.trainer.behavior, *(o.behavior for o in self.opponents)} - announced.keys()
+        if missing:
+            logging.getLogger(__name__).info("Comportements en attente : %s.", ", ".join(sorted(missing)))
+            return
+        # Vérifier tous les schémas avant le premier envoi.
+        for opponent in self.opponents:
+            opponent.validate_behavior(announced[opponent.behavior])
+        self.connection = connection
+        for opponent in self.opponents:
+            if not opponent.ready and opponent.pending_version is None:
+                logging.getLogger(__name__).info("Envoi de la snapshot %r.", opponent.behavior)
+                opponent.send(connection)
+        if self.ready:
+            self.trainer.on_connect(connection)
+
+    def on_model_ack(self, connection: UnityConnection, header: dict[str, object]) -> None:
+        if connection is not self.connection:
+            return
+        opponent = next((o for o in self.opponents if o.behavior == header.get('behavior')), None)
+        if opponent is not None:
+            if opponent.on_model_ack(connection, header) and self.ready:
+                logging.getLogger(__name__).info("Toutes les snapshots sont acceptées ; envoi de l'apprenant.")
+                self.trainer.on_connect(connection)
+        elif self.ready:
+            self.trainer.on_model_ack(connection, header)
+
+    def on_batch(self, connection: UnityConnection, batch) -> None:
+        if connection is self.connection and self.ready and batch.behavior == self.trainer.behavior:
+            self.trainer.on_batch(connection, batch)
+
+    def on_disconnect(self, connection: UnityConnection) -> None:
+        if connection is not self.connection:
+            return
+        self.trainer.on_disconnect(connection)
+        for opponent in self.opponents:
+            opponent.on_disconnect(connection)
+        self.connection = None

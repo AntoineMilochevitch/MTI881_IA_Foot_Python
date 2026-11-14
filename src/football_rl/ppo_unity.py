@@ -14,7 +14,7 @@ from iafoot import Batch, DecoderExport, ModelExport, TrainingServer, UnityConne
 from football_rl.ppo_checkpoint import load_checkpoint
 from football_rl.ppo_export import export_actor
 from football_rl.ppo_network import PPOActorNetwork
-from football_rl.ppo_opponent import FrozenOpponent
+from football_rl.ppo_opponent import FrozenOpponent, FrozenOpponentPool
 from football_rl.ppo_trainer import PPOTrainerConfig, PPOUnityTrainer
 
 
@@ -74,6 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="nom de l'expérience (défaut : ppo_AAAAMMJJ-HHMMSS)")
     parser.add_argument("--resume", default=None,
                         help="chemin du checkpoint à reprendre")
+    parser.add_argument("--opponent", action="append", nargs=2, default=[],
+                        metavar=("BEHAVIOR", "CHECKPOINT"),
+                        help="snapshot fig?e ; r?p?ter cette option pour plusieurs adversaires")
     parser.add_argument("--opponent-checkpoint", default=None,
                         help="chemin de la snapshot de l'adversaire")
     parser.add_argument("--opponent-behavior", default="FootSnapshot",
@@ -156,25 +159,20 @@ def main(argv: list[str] | None = None) -> None:
     except (ValueError, TypeError, RuntimeError) as error:
         parser.error(str(error))
 
-    if args.opponent_checkpoint is not None:
-        if (
-            not args.opponent_behavior.strip()
-            or args.opponent_behavior == "*"
-            or args.opponent_behavior == config.behavior
-        ):
-            parser.error(
-                "--opponent-behavior doit être non vide, différent de '*' "
-                "et différent de --behavior."
-            )
-        try:
-            opponent = FrozenOpponent(
-                args.opponent_checkpoint,
-                behavior=args.opponent_behavior,
-            )
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
-            parser.error(f"Impossible de charger le checkpoint adverse : {error}")
-    else:
-        opponent = None
+    if args.opponent and args.opponent_checkpoint is not None:
+        parser.error("Utiliser --opponent ou --opponent-checkpoint, pas les deux.")
+    opponent_specs = args.opponent or (
+        [(args.opponent_behavior, args.opponent_checkpoint)] if args.opponent_checkpoint else []
+    )
+    names = [name for name, _ in opponent_specs]
+    if len(set(names)) != len(names) or any(
+        not name.strip() or name == "*" or name == config.behavior for name in names
+    ):
+        parser.error("Les comportements adverses doivent ?tre distincts entre eux et de l'apprenant.")
+    try:
+        opponents = [FrozenOpponent(path, behavior=name) for name, path in opponent_specs]
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        parser.error(f"Impossible de charger une snapshot adverse : {error}")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(message)s")
@@ -189,62 +187,12 @@ def main(argv: list[str] | None = None) -> None:
     server = TrainingServer(args.host, args.port, debug=args.verbose)
     logger = logging.getLogger(__name__)
 
-    def on_connect(connection: UnityConnection) -> None:
-        if opponent is None:
-            trainer.on_connect(connection)
-            return
-        if opponent.connection is not None and opponent.connection is not connection:
-            raise RuntimeError("Une autre connexion utilise déjà l'adversaire.")
-        if opponent.connection is connection and (
-            opponent.pending_version is not None
-        ):
-            logger.info("Snapshot adverse déjà envoyée ; attente de son accusé.")
-            return
-        announced_behaviors = {
-            behavior.get("name") for behavior in connection.behaviors
-        }
-        missing_behaviors = {
-            config.behavior,
-            opponent.behavior,
-        } - announced_behaviors
-        if missing_behaviors:
-            logger.info(
-                "Comportements en attente : %s.",
-                ", ".join(sorted(missing_behaviors)),
-            )
-            return
-        if opponent.ready:
-            logger.info("Snapshot adverse prête ; vérification du comportement apprenant.")
-            trainer.on_connect(connection)
-            return
-        logger.info("Envoi de la snapshot adverse %r.", opponent.behavior)
-        opponent.send(connection)
-
-    def on_model_ack(connection: UnityConnection, header: dict[str, object]) -> None:
-        if opponent is None:
-            trainer.on_model_ack(connection, header)
-            return
-        if opponent.on_model_ack(connection, header):
-            logger.info("Snapshot adverse acceptée ; envoi de l'acteur apprenant.")
-            trainer.on_connect(connection)
-        elif opponent.ready and connection is opponent.connection:
-            trainer.on_model_ack(connection, header)
-
-    def on_batch(connection: UnityConnection, batch: Batch) -> None:
-        if opponent is None:
-            trainer.on_batch(connection, batch)
-        elif opponent.ready and connection is opponent.connection:
-            trainer.on_batch(connection, batch)
-
-    def on_disconnect(connection: UnityConnection) -> None:
-        trainer.on_disconnect(connection)
-        if opponent is not None:
-            opponent.on_disconnect(connection)
-
-    server.on_connect = on_connect
-    server.on_batch = on_batch
-    server.on_model_ack = on_model_ack
-    server.on_disconnect = on_disconnect
+    # Le pool vide conserve aussi le fonctionnement solo / bot / self-play.
+    pool = FrozenOpponentPool(opponents, trainer)
+    server.on_connect = pool.on_connect
+    server.on_batch = pool.on_batch
+    server.on_model_ack = pool.on_model_ack
+    server.on_disconnect = pool.on_disconnect
     mode = (
         "évaluation"
         if config.evaluate

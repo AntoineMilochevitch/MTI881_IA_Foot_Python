@@ -237,6 +237,29 @@ Les callbacks du serveur sont sérialisés. Rendre la main après `send_model`
 permet au serveur de traiter `model_ack`. Une attente bloquante de cet accusé de
 réception à l'intérieur du callback empêcherait sa réception.
 
+### Plusieurs adversaires fixes sur les terrains
+
+Le composant facultatif `ArenaOpponentMix`, placé sur `ArenaReplicator`, affecte
+les adversaires avant l'inscription des agents au pont. Le menu **IA Foot >
+Entraînement parallèle > Configurer le mélange 16 bots + 8 anciennes + 8 récentes**
+prépare 32 terrains : les 16 premiers contre `SimpleBotInput`, les 8 suivants
+contre `FootSnapshotOld`, les 8 derniers contre `FootSnapshotRecent`.
+
+Les bleus utilisent tous `Foot` avec enregistrement ; les rouges snapshots
+n'enregistrent pas. Les contrôleurs humains et les bots concurrents sont
+désactivés. Un `SimpleBotInput` absent est ajouté avec ses valeurs par défaut ;
+s'il existe déjà, ses réglages sont conservés. La physique, les récompenses et
+les apparitions ne sont pas modifiées. Les deux joueurs source doivent être
+actifs et posséder un `FootAgent` déjà configuré. Désactiver `ArenaOpponentMix`
+hors Play restitue la duplication habituelle de la scène.
+
+Le `hello` annonce 3 comportements et 48 agents (32 apprenants + 16 snapshots).
+Chaque agent contient aussi `opponent_group` (`bot`, `snapshot_old` ou
+`snapshot_recent`) et `record_experience`. Ces métadonnées sont facultatives
+pour les anciens clients ; le format des transitions et la version du
+protocole restent inchangés. Le serveur doit installer les deux snapshots et
+recevoir leurs accusés avant de démarrer la collecte apprenante.
+
 ## 5. Contraintes de collecte
 
 Unity continue à simuler pendant que Python travaille. Un lot peut contenir
