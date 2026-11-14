@@ -145,7 +145,8 @@ def update_minibatch(
     critic_optimizer: torch.optim.Optimizer,
     mini_batch: dict[str, torch.Tensor],
     clip_epsilon: float,
-    max_grad_norm: float
+    max_grad_norm: float,
+    entropy_coef: float = 0.0,
 ) -> dict[str, float]:
     """Met à jour les réseaux de l'acteur et du critique pour un mini-batch donné.
 
@@ -165,6 +166,9 @@ def update_minibatch(
         norme maximale des gradients pour le clipping
     """
     
+    if not math.isfinite(entropy_coef) or entropy_coef < 0:
+        raise ValueError("entropy_coef doit être fini et positif ou nul.")
+
     actor_optimizer.zero_grad()
     critic_optimizer.zero_grad()
     
@@ -172,13 +176,20 @@ def update_minibatch(
     
     predicted_values = critic(mini_batch["obs"])["value"]
     
-    actor_loss = compute_actor_loss(
+    actor_policy_loss = compute_actor_loss(
         new_log_probs=new_log_probs,
         old_log_probs=mini_batch["old_log_probs"],
         advantages=mini_batch["advantages"],
         clip_epsilon=clip_epsilon
     )
     
+    # Minimiser L_PPO - coef * H encourage la diversité des actions.
+    # Ce terme régularise l'acteur ; les cibles du critique utilisent les
+    # récompenses du rollout et leur shaping habituel.
+    entropy = actor.evaluate_entropy(mini_batch["obs"])["total"].mean()
+    entropy_bonus = entropy_coef * entropy
+    actor_loss = actor_policy_loss - entropy_bonus
+
     critic_loss = compute_critic_loss(
         predicted_values=predicted_values,
         target_values=mini_batch["returns"]
@@ -203,6 +214,8 @@ def update_minibatch(
     
     return {
         "actor_loss": actor_loss.item(),
+        "actor_policy_loss": actor_policy_loss.item(),
+        "entropy_bonus": entropy_bonus.item(),
         "critic_loss": critic_loss.item(),
         "actor_grad_norm": actor_grad_norm.detach().item(),
         "critic_grad_norm": critic_grad_norm.detach().item() 
@@ -218,7 +231,8 @@ def train_ppo_epochs(
     max_grad_norm: float,
     num_epochs: int,
     mini_batch_size: int,
-    target_kl: float | None = None
+    target_kl: float | None = None,
+    entropy_coef: float = 0.0,
 ) -> list[dict[str, float | int | bool]]:
     """Entraîne les réseaux de l'acteur et du critique sur plusieurs époques.
 
@@ -269,10 +283,13 @@ def train_ppo_epochs(
     for epoch in range(num_epochs):
         critic_sum_loss = 0.0
         actor_sum_loss = 0.0
+        actor_policy_sum_loss = 0.0
+        entropy_bonus_sum = 0.0
         critic_grad_norm_sum = 0.0
         actor_grad_norm_sum = 0.0
         transition_count = 0
         update_count = 0
+        kl_limit_reached = False
         for mini_batch in iterate_mini_batches(training_data, mini_batch_size):
             loss_info = update_minibatch(
                 actor=actor,
@@ -281,30 +298,41 @@ def train_ppo_epochs(
                 critic_optimizer=critic_optimizer,
                 mini_batch=mini_batch,
                 clip_epsilon=clip_epsilon,
-                max_grad_norm=max_grad_norm
+                max_grad_norm=max_grad_norm,
+                entropy_coef=entropy_coef,
             )
             batch_size = len(mini_batch["obs"])
             critic_sum_loss += batch_size * loss_info["critic_loss"]
             actor_sum_loss += batch_size * loss_info["actor_loss"]
+            actor_policy_sum_loss += batch_size * loss_info["actor_policy_loss"]
+            entropy_bonus_sum += batch_size * loss_info["entropy_bonus"]
             critic_grad_norm_sum += loss_info["critic_grad_norm"]
             actor_grad_norm_sum += loss_info["actor_grad_norm"]
             transition_count += batch_size
             update_count += 1
 
-        policy_metrics = evaluate_policy_on_rollout(
-            actor=actor,
-            training_data=training_data,
-            clip_epsilon=clip_epsilon,
-            evaluation_batch_size=mini_batch_size
-        )
-        kl_limit_reached = (
-            target_kl is not None
-            and policy_metrics["approx_kl"] > target_kl
-        )
+            # Mesurer sur tout le rollout évite de décider à partir du bruit
+            # d'un seul mini-lot. Arrêter dès le premier pas qui franchit la
+            # cible évite de poursuivre jusqu'à la fin de l'époque.
+            # Le dernier pas reste appliqué : target_kl est une cible d'arrêt.
+            if target_kl is not None:
+                policy_metrics = evaluate_policy_on_rollout(
+                    actor, training_data, clip_epsilon, mini_batch_size
+                )
+                kl_limit_reached = policy_metrics["approx_kl"] > target_kl
+                if kl_limit_reached:
+                    break
+
+        if target_kl is None:
+            policy_metrics = evaluate_policy_on_rollout(
+                actor, training_data, clip_epsilon, mini_batch_size
+            )
 
         history.append({
             "epoch": epoch + 1,
             "actor_loss": actor_sum_loss / transition_count,
+            "actor_policy_loss": actor_policy_sum_loss / transition_count,
+            "entropy_bonus": entropy_bonus_sum / transition_count,
             "critic_loss": critic_sum_loss / transition_count,
             "actor_grad_norm": actor_grad_norm_sum / update_count,
             "critic_grad_norm": critic_grad_norm_sum / update_count,
@@ -448,7 +476,8 @@ def train_ppo(
     max_grad_norm: float,
     num_epochs: int,
     mini_batch_size: int,
-    target_kl: float | None = None
+    target_kl: float | None = None,
+    entropy_coef: float = 0.0,
 ) -> list[dict[str, float | int | bool]]:
     """Prépare une collecte puis entraîne PPO pendant plusieurs époques."""
     if len(buffer) <= 0:
@@ -507,6 +536,7 @@ def train_ppo(
         max_grad_norm=max_grad_norm,
         num_epochs=num_epochs,
         mini_batch_size=mini_batch_size,
-        target_kl=target_kl
+        target_kl=target_kl,
+        entropy_coef=entropy_coef,
     )
             

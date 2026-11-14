@@ -46,7 +46,17 @@ Pour les quatre commandes continues, l'acteur choisit une **moyenne**, puis tire
 
 Pour `shoot`, `tackle` et `jump`, il apprend une probabilité d'activation, puis tire 0 ou 1.
 
-Une action peut donc sembler aléatoire même si la politique a appris quelque chose. Une baisse de l'écart-type signifie qu'elle devient plus concentrée, pas forcément meilleure. Il n'y a actuellement **pas de bonus d'entropie** dans la loss.
+Une action peut donc sembler aléatoire même si la politique a appris quelque chose. Une baisse de l'écart-type signifie qu'elle devient plus concentrée, pas forcément meilleure.
+
+L'**entropie** mesure la diversité des choix. Pour les commandes continues, elle augmente avec l'écart-type. Pour un bouton, elle est maximale à une probabilité de `0,5` et faible près de `0` ou `1`.
+
+Le bonus optionnel `--entropy-coef 0.001` encourage à conserver cette diversité :
+
+```text
+loss acteur = loss PPO − coefficient × entropie moyenne
+```
+
+Le coefficient vaut **0 par défaut**, y compris pour les anciens checkpoints. Le bonus ne change ni les récompenses ni les cibles du critique. Il peut freiner la baisse de l'exploration, mais ne force pas les écarts-types à augmenter et ne garantit pas de meilleurs comportements. La limite KL reste active.
 
 Unity borne les commandes avant de les appliquer. PPO conserve les **actions brutes tirées** pour calculer leurs probabilités : il ne faut pas les remplacer par les commandes bornées dans le buffer.
 
@@ -79,7 +89,7 @@ Une **époque** est un passage sur le rollout, découpé en mini-lots. Plusieurs
 
 Les réglages par défaut sont : rollout `2048`, mini-lot `128`, maximum `4` époques, learning rates acteur/critique `0,0003`, `gamma = 0,99`, `gae_lambda = 0,95`, clipping `0,2` et cible KL `0,01`. Les commandes plus bas utilisent un rollout de `512`.
 
-La KL est vérifiée après chaque époque : un arrêt conserve les mises à jour déjà effectuées. Augmenter le nombre d'époques n'aide donc pas si cet arrêt intervient déjà tôt.
+La KL est mesurée sur tout le rollout après chaque mini-lot. Dès que la cible est dépassée, le cycle d'optimisation s'arrête, même au milieu d'une époque. Le dernier pas reste appliqué, donc la cible peut être légèrement dépassée. Ce contrôle ajoute des calculs. `ppo/epochs_done` compte les époques commencées et `ppo/optimizer_steps` donne le nombre réel de pas Adam du cycle.
 
 ## 4. Récompenses et shaping : la différence
 
@@ -154,8 +164,21 @@ Choisir la scène et les adversaires **dans Unity** :
 - **Solo aléatoire** : activer les apparitions aléatoires du `MatchManager` et désactiver le GameObject de l'adversaire.
 - **Contre le bot** : adversaire avec `SimpleBotInput` actif et `FootAgent` désactivé.
 - **Self-play** : deux joueurs d'équipes opposées, chacun avec `FootAgent` et le même comportement `Foot`. Ils partagent le même acteur.
+- **Snapshot fixe** : apprenant `Foot` avec `Record Experience` coché ; adversaire `FootSnapshot` avec cette case décochée. Les deux utilisent `FootAgent`, sans contrôleur humain ni bot.
 
 Le nom du run Python ne sélectionne pas la scène ni les apparitions aléatoires. Voir le guide Unity pour leur configuration.
+
+Avec plusieurs terrains, conserver `Clone Scene Arena` coché sur `ArenaReplicator` pour reproduire ces réglages partout. `Random Spawns → Mode = Around Ball` tire le ballon dans la zone jouable puis les joueurs autour : bleu à gauche du rouge, distances plus courtes près du but défendu. Les intervalles et angles sont réglables dans Unity ([détails](README_UNITY.md#plusieurs-terrains-et-départs-autour-du-ballon)).
+
+Le rollout est **global**. Avec 32 apprenants, un seuil de 512 représente environ 16 décisions par joueur, contre 64 avec 2048, hors dépassement de lot et fins d'épisode. Un rollout plus grand donne davantage de contexte au GAE et de situations par mise à jour. Une reprise garde le volume sauvegardé sauf si `--rollout-size` est fourni.
+
+Diagnostic contre une snapshot (aucune optimisation ni sauvegarde) :
+
+```powershell
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/snapshots/adversaire_v1.pt --opponent-checkpoint checkpoints/snapshots/adversaire_v1.pt --opponent-behavior FootSnapshot --collect-only --run-name diagnostic_snapshot_32 --verbose
+```
+
+Avec 32 terrains en 1 contre 1, attendre deux comportements et 64 agents dans `hello`, puis des batchs `Foot` seulement. Une fois le diagnostic validé, retirer `--collect-only` et choisir un nouveau nom de run pour l'entraînement avec ces nouveaux départs.
 
 ### Démarrer de zéro
 
@@ -176,7 +199,15 @@ python -m football_rl.ppo_unity --device cuda --resume checkpoints/solo_random_p
 
 Le même `--run-name` conserve le dossier TensorBoard et le dossier de sauvegarde. Le fichier est bien **`latest.pt`**.
 
-La reprise restaure les réseaux, les optimiseurs, les compteurs et les réglages d'apprentissage, dont le shaping. Ajouter un autre learning rate ou rollout dans cette commande ne remplace pas les valeurs sauvegardées. Le device et les options d'évaluation peuvent changer.
+La reprise restaure les réseaux, les optimiseurs, les compteurs et les réglages d'apprentissage, dont le shaping. Les options explicites `--actor-lr`, `--rollout-size`, `--mini-batch-size`, `--parity-atol` et `--entropy-coef` remplacent les valeurs sauvegardées. En leur absence, les valeurs du checkpoint sont conservées. Le LR acteur est réappliqué après le chargement d'Adam, qui conserve ses moments et son compteur. Les valeurs effectives sont affichées au démarrage. Le device et les options d'évaluation peuvent aussi changer.
+
+Pour reprendre l'essai contre la snapshot avec 32 terrains, un LR acteur de `1e-4`, un rollout de `2048` et des mini-lots de `256` donnent un essai avec des mises à jour plus prudentes. Le nouveau nom conserve les courbes et checkpoints précédents pour comparaison.
+
+```powershell
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/snapshot_v1_lr_1e4/latest.pt --actor-lr 0.0001 --rollout-size 2048 --mini-batch-size 256 --parity-atol 0.0005 --opponent-checkpoint checkpoints/snapshots/adversaire_v1.pt --opponent-behavior FootSnapshot --run-name snapshot_v1_lr_1e4_rollout2048
+```
+
+La tolérance `5e-4` accepte l'écart observé de `1,38e-4` entre Python et Unity. C'est un assouplissement du contrôle numérique dont la cause exacte reste à confirmer. Un écart accepté supérieur à `1e-4` produit un avertissement. Un dépassement de la tolérance arrête la collecte et sauvegarde les poids et le lot dans `parity_failure.pt`, dans le dossier des checkpoints du run, pour reproduire le problème.
 
 Un checkpoint est enregistré après chaque cycle réussi, avec une archive tous les dix cycles. La partie Unity et le rollout incomplet ne sont pas sauvegardés. Une déconnexion conserve les réseaux en mémoire tant que Python reste ouvert, mais abandonne la collecte incomplète.
 
@@ -193,6 +224,22 @@ Les poids restent fixes, mais **les actions restent tirées au hasard dans les d
 Pour comparer deux checkpoints, utiliser les mêmes conditions : bot, règles d'apparition, durée maximale et récompenses. Donner un nom distinct à chaque évaluation. Les retours affichés sont ceux d'Unity, sans shaping Python.
 
 En self-play partagé, chaque but produit une victoire et une défaite parmi les deux joueurs. Les résultats globaux peuvent donc rester équilibrés même si le niveau change. **L'évaluation contre un bot fixe sert de référence.**
+
+### Comparer avec et sans bonus d'entropie
+
+Une copie figée du run `snapshot_contact_005` est conservée dans `checkpoints/snapshots/entropy_reference_7899330.pt`, à **7 899 330 transitions**. Conserver les mêmes règles Unity, récompenses, apparitions et snapshot adverse pour les deux essais. Les deux commandes suivantes sont à lancer **séparément** :
+
+```powershell
+# Témoin : poursuivre sans bonus
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/snapshots/entropy_reference_7899330.pt --opponent-checkpoint checkpoints/snapshots/adversaire_v1.pt --opponent-behavior FootSnapshot --entropy-coef 0 --run-name entropy_control_7899330
+
+# Essai : même point de départ, petit bonus
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/snapshots/entropy_reference_7899330.pt --opponent-checkpoint checkpoints/snapshots/adversaire_v1.pt --opponent-behavior FootSnapshot --entropy-coef 0.001 --run-name entropy_001_7899330
+```
+
+Faire environ **300 000 transitions supplémentaires par essai** : arrêter vers `8 199 330` transitions entraînées, à la fin d'un cycle. Ce seuil n'est pas un arrêt automatique. Pour reprendre un essai interrompu, utiliser **son propre** `checkpoints/<nom_du_run>/latest.pt` et le même nom de run.
+
+Évaluer ensuite chaque `latest.pt` sur **500 épisodes sportifs**, avec `--evaluate --evaluation-episodes 500`, le même adversaire et un nom d'évaluation distinct. Comparer buts marqués, encaissés et timeouts ; une entropie plus élevée n'est pas à elle seule une réussite. Les tirages Unity restent aléatoires : les mêmes réglages ne garantissent pas des parties identiques.
 
 ### Diagnostiquer le pont
 
@@ -215,6 +262,7 @@ Ouvrir <http://localhost:6006>. Observer les tendances sur plusieurs milliers de
 | Mesure | Ce qu'elle permet de comprendre |
 | --- | --- |
 | `episodes/outcome_goal_scored`, `outcome_goal_conceded`, `outcome_timeout` | Résultats sportifs : surtout utiles face à un adversaire fixe. Vérifier aussi le nombre d'épisodes. |
+| `sport/goal_scored_fraction`, `sport/goal_conceded_fraction`, `sport/timeout_fraction` | Proportions calculées uniquement sur les buts et timeouts. `sport/count` donne le nombre d'épisodes sportifs dans le lot. |
 | `episodes/return_mean` | Récompense totale moyenne reçue d'Unity, **sans shaping Python**. Comparer à réglages de récompense identiques. |
 | `approach/distance_mean_normalized` | Distance joueur–ballon : une baisse indique qu'il en est plus proche en moyenne. |
 | `approach/episodes_with_kick_opportunity_fraction` | Part des épisodes sportifs complets suivis où une occasion de frappe a existé. Une occasion n'est pas un contact réel. |
@@ -223,10 +271,14 @@ Ouvrir <http://localhost:6006>. Observer les tendances sur plusieurs milliers de
 | `ppo/approx_kl`, `ppo/epochs_done` | Ampleur du changement de politique et nombre d'époques réellement effectuées. Des arrêts KL fréquents invitent à examiner le learning rate. |
 | `ppo/clip_fraction` | Part des ratios hors de la zone de clipping. Une valeur élevée indique des changements importants, pas de meilleures actions. |
 | `exploration/std_move_x`, `exploration/std_move_z` | Dispersion des actions de déplacement. Leur baisse ne suffit pas à démontrer une progression. |
+| `exploration/entropy_continuous`, `exploration/entropy_binary`, `exploration/entropy_total` | Diversité des quatre commandes continues, des trois boutons et leur somme, après optimisation sur les observations du rollout. |
+| `exploration/entropy_coef`, `loss/entropy_bonus` | Coefficient utilisé et terme soustrait à la loss acteur. `loss/actor_policy_loss` isole la loss PPO sans bonus. |
+
+L'entropie est exprimée en **nats**. Celle des normales est calculée sur les **actions brutes avant bornage Unity** : elle peut être négative et ne mesure pas exactement la diversité des mouvements exécutés. L'entropie des trois boutons est comprise entre `0` et `3 × ln(2) ≈ 2,08`. La loss et le bonus affichés sont des moyennes pendant les mises à jour ; les entropies sont mesurées après celles-ci.
 
 La loss acteur peut être négative : inutile de chercher à la faire tendre vers zéro. Les buts et les occasions de frappe donnent une mesure plus directe du progrès.
 
-Pendant l'entraînement, les proportions d'issues TensorBoard portent sur les résumés reçus, qui peuvent inclure des interruptions. En évaluation, les statistiques sportives utilisent uniquement les épisodes sportifs et leur nombre comme axe horizontal.
+Pendant l'entraînement, les proportions `episodes/outcome_*` portent sur tous les résumés reçus. Les nouvelles séries `sport/*` excluent les interruptions et `match_over`. Elles restent des mesures par lot et peuvent fluctuer lorsque peu de parties finissent ensemble. `match_over` et `disabled` sont désormais écrits à zéro lorsqu'ils sont absents, pour éviter un lissage sur les seuls lots où ils apparaissent. En évaluation, l'axe horizontal compte les épisodes sportifs.
 
 ## 7. Où se trouve le code ?
 

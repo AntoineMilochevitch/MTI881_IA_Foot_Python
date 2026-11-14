@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 logger = logging.getLogger(__name__)
 
-KNOWN_OUTCOMES = ("goal_scored", "goal_conceded", "timeout", "interrupted")
+KNOWN_OUTCOMES = ("goal_scored", "goal_conceded", "timeout", "interrupted", "match_over", "disabled")
 
 class PPOTensorBoardLogger:
     """Écrit les métriques d'une expérience dans un dossier TensorBoard"""
@@ -59,9 +59,14 @@ class PPOTensorBoardLogger:
                 "ppo/clip_fraction": last["clip_fraction"],
                 "ppo/ratio_mean": last["ratio_mean"],
                 "ppo/epochs_done": len(history),
+                "ppo/optimizer_steps": sum(entry["num_updates"] for entry in history),
                 "ppo/kl_limit_reached": float(last["kl_limit_reached"])
             }
             scalars.update(extras or {})
+            # Disponibles pour les nouveaux entraînements, même avec coef=0.
+            for name in ("actor_policy_loss", "entropy_bonus"):
+                if name in last:
+                    scalars[f"loss/{name}"] = last[name]
             self._write(step, scalars)
         except Exception:
             logger.warning("Suivi TensorBoard : cycle non enregistré.", exc_info=True)
@@ -84,6 +89,14 @@ class PPOTensorBoardLogger:
             names = list(KNOWN_OUTCOMES) + [o for o in outcomes if o not in KNOWN_OUTCOMES]
             for outcome in names:
                 scalars[f"episodes/outcome_{outcome}"] = outcomes.get(outcome, 0) / len(episodes)
+            # Un match_over ou une interruption ne doit pas diluer le taux
+            # de buts. Les anciennes séries gardent leur dénominateur historique.
+            sporting_outcomes = ("goal_scored", "goal_conceded", "timeout")
+            sporting_count = sum(outcomes[name] for name in sporting_outcomes)
+            scalars["sport/count"] = sporting_count
+            if sporting_count:
+                for outcome in sporting_outcomes:
+                    scalars[f"sport/{outcome}_fraction"] = outcomes[outcome] / sporting_count
             self._write(step, scalars)
         except Exception:
             logger.warning("Suivi TensorBoard : épisodes non enregistrés.", exc_info=True)

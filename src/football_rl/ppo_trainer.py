@@ -43,6 +43,8 @@ class PPOTrainerConfig:
     device: str | torch.device = "cpu"
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
+    # Zéro conserve le comportement des checkpoints créés avant ce réglage.
+    entropy_coef: float = 0.0
     batch_size: int = 256
     time_scale: float = 1.0
     rollout_size: int = 2048
@@ -63,6 +65,13 @@ class PPOTrainerConfig:
     ball_approach_shaping: float = 0.0
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.entropy_coef, bool)
+            or not isinstance(self.entropy_coef, (int, float))
+            or not math.isfinite(self.entropy_coef)
+            or self.entropy_coef < 0
+        ):
+            raise ValueError("entropy_coef doit être un nombre fini >= 0.")
         if (
             isinstance(self.ball_approach_shaping, bool)
             or not isinstance(self.ball_approach_shaping, (int, float))
@@ -320,6 +329,10 @@ class PPOUnityTrainer:
                     restore_optimizers(
                         pending_checkpoint, actor_optimizer, critic_optimizer
                     )
+                    # Adam restaure aussi son ancien LR. Réappliquer le réglage
+                    # résolu par la CLI conserve ses moments et son compteur de pas.
+                    for group in actor_optimizer.param_groups:
+                        group["lr"] = self.actor_lr
                     if self.diagnostic_no_jump_tackle:
                         self._disable_jump_and_tackle(actor)
                     restored_rng_state = pending_checkpoint["torch_rng_state"]
@@ -333,6 +346,7 @@ class PPOUnityTrainer:
                     self.pending_checkpoint = None
                 self.actor, self.critic = actor, critic
                 self.actor_optimizer, self.critic_optimizer = actor_optimizer, critic_optimizer
+                logger.info("LR effectif dans Adam acteur : %g.", actor_optimizer.param_groups[0]["lr"])
 
             self.schema = schema
             self.session_id = session_id
@@ -650,10 +664,34 @@ class PPOUnityTrainer:
         if not all(math.isfinite(value) for value in self.last_parity.values()):
             raise ValueError("La comparaison des log-probabilités n'est pas finie.")
         if self.last_parity["max_log_prob_error"] > self.config.parity_atol:
+            # Conserver exactement le lot fautif et les poids avant que
+            # _set_error vide le buffer, pour comparer CPU, GPU et Unity.
+            if self.checkpoint_dir is not None:
+                diagnostic_path = self.checkpoint_dir / "parity_failure.pt"
+                try:
+                    save_checkpoint({
+                        "actor_state_dict": {
+                            name: value.detach().cpu().clone()
+                            for name, value in self.actor.state_dict().items()
+                        },
+                        "chunk": {name: value.detach().cpu().clone() for name, value in chunk.items()},
+                        "python_log_probs": python_log_probs,
+                        "config": {**asdict(self.config), "device": str(self.device)},
+                        "policy_version": self.active_version,
+                    }, str(diagnostic_path))
+                    logger.error("Lot de diagnostic enregistré dans %s.", diagnostic_path)
+                except Exception:
+                    logger.warning("Impossible de sauvegarder le diagnostic de parité.", exc_info=True)
             raise ValueError(
                 "Incohérence Python/Unity : écart maximal de log-probabilité "
                 f"{errors.max().item():.6g} > {self.config.parity_atol:.6g}. "
                 "Vérifier les actions brutes, l'ordre des sorties et le décodeur exporté."
+            )
+        if self.last_parity["max_log_prob_error"] > 1e-4:
+            logger.warning(
+                "Écart logp à surveiller : max=%.6g, moyenne=%.6g, tolérance=%.6g.",
+                self.last_parity["max_log_prob_error"],
+                self.last_parity["mean_log_prob_error"], self.config.parity_atol,
             )
         self.rollout_max_log_prob_error = max(
             self.rollout_max_log_prob_error, self.last_parity["max_log_prob_error"]
@@ -727,6 +765,7 @@ class PPOUnityTrainer:
                 clip_epsilon=self.config.clip_epsilon, max_grad_norm=self.config.max_grad_norm,
                 num_epochs=self.config.num_epochs, mini_batch_size=self.config.mini_batch_size,
                 target_kl=self.config.target_kl,
+                entropy_coef=self.config.entropy_coef,
             )
             self.update_count += 1
             self.trained_transitions += sample_count
@@ -783,6 +822,19 @@ class PPOUnityTrainer:
             # Exploration : écarts-types réellement utilisés (log_std borné puis exponentié).
             with torch.no_grad():
                 stds = torch.exp(self.actor.log_std.clamp(-5.0, 2.0)).cpu().tolist()
+                # Mesurer la politique après optimisation sur les observations
+                # de toute la collecte. Pondérer correctement le dernier lot.
+                observations = self.buffer.get_data()["obs"]
+                entropy_sums = {"continuous": 0.0, "binary": 0.0, "total": 0.0}
+                for start in range(0, len(observations), self.config.mini_batch_size):
+                    entropy = self.actor.evaluate_entropy(
+                        observations[start:start + self.config.mini_batch_size].to(self.device)
+                    )
+                    for name, values in entropy.items():
+                        entropy_sums[name] += values.sum().item()
+                for name, total in entropy_sums.items():
+                    extras[f"exploration/entropy_{name}"] = total / len(observations)
+                extras["exploration/entropy_coef"] = self.config.entropy_coef
             for name, std in zip(CONTINUOUS_STD_NAMES, stds):
                 extras[f"exploration/std_{name}"] = std
 

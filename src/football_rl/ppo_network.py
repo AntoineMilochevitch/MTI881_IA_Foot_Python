@@ -121,6 +121,21 @@ class PPOActorNetwork(FootballNetwork):
             "binary_logits": binary_logits
         }
         
+    def evaluate_entropy(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Entropie analytique par observation, en nats.
+
+        Les quatre normales décrivent les actions brutes avant le bornage
+        Unity. Leur entropie différentielle peut être négative. Les trois
+        Bernoulli mesurent la diversité des décisions tirer, tacler et sauter.
+        La somme correspond à la distribution jointe factorisée de l'acteur.
+        """
+        output = self.forward(x)
+        continuous = Normal(
+            output["continuous_mean"], output["continuous_log_std"].exp()
+        ).entropy().sum(dim=-1)
+        binary = Bernoulli(logits=output["binary_logits"]).entropy().sum(dim=-1)
+        return {"continuous": continuous, "binary": binary, "total": continuous + binary}
+
     @staticmethod
     def calculate_log_prob(
         normal_dist: Normal,

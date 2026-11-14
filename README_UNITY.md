@@ -109,6 +109,33 @@ politique figée : le lancement propre à l'algorithme doit gérer ce second usa
 Pour continuer à simuler hors focus, activer **Edit → Project Settings → Player
 → Resolution and Presentation → Run In Background**, puis relancer Play.
 
+### Plusieurs terrains et départs autour du ballon
+
+`ArenaReplicator` lance plusieurs matchs indépendants avec un seul `TrainingBridge`.
+`Arena Count` règle leur nombre (32 dans la scène Demo). Avec `Clone Scene Arena`
+coché, les copies reprennent la configuration de l'arène visible : contrôleurs,
+comportements, enregistrement, récompenses et positions de départ. Décoché, elles
+utilisent le prefab, qui doit alors être synchronisé avec la scène.
+
+Les observations restent dans le repère de chaque arène. Le pont fournit des
+`agent_id` et `episode_id` uniques pour séparer les trajectoires. La taille d'un
+batch désigne le total de transitions de toutes les arènes pour un comportement.
+Le champ `arena` du message `hello` permet de vérifier leur provenance.
+
+Dans **Arena → Match Manager → Random Spawns**, `Mode = Around Ball` place le
+ballon dans la zone configurée, puis les joueurs autour de lui. Le bleu reste
+à gauche du rouge selon l'axe du terrain. Plus le ballon est près du but défendu,
+plus l'intervalle de distance du joueur est court. Réglages initiaux :
+
+- `Near Goal Distance` : `0.4–0.55` unité ; `Far Goal Distance` : `0.55–0.8` unité.
+- `Angle Degrees` : `-180–180`, donc tout autour du ballon ; angle zéro vers son camp.
+- `Minimum Distance` : séparation minimale, qui reste prioritaire sur ces intervalles.
+
+Un placement invalide déclenche un nouveau tirage, sans rabattre les positions sur les murs.
+`Mode = Free` retrouve le tirage indépendant ; décocher `Enabled` retrouve les
+points fixes. Les réglages détaillés et les tests sont dans le README Unity
+`Assets/IAFoot/README.md`.
+
 ### Ce que fait le serveur Python
 
 1. `on_connect` reçoit `hello` et sélectionne le comportement demandé.

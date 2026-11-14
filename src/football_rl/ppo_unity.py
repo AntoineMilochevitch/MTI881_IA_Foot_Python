@@ -9,11 +9,12 @@ import sys
 from typing import Any
 
 import torch
-from iafoot import DecoderExport, ModelExport, TrainingServer
+from iafoot import Batch, DecoderExport, ModelExport, TrainingServer, UnityConnection
 
 from football_rl.ppo_checkpoint import load_checkpoint
 from football_rl.ppo_export import export_actor
 from football_rl.ppo_network import PPOActorNetwork
+from football_rl.ppo_opponent import FrozenOpponent
 from football_rl.ppo_trainer import PPOTrainerConfig, PPOUnityTrainer
 
 
@@ -36,13 +37,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size,
                         help="transitions par message envoyé par Unity")
     parser.add_argument("--time-scale", type=float, default=defaults.time_scale)
-    parser.add_argument("--rollout-size", type=int, default=defaults.rollout_size,
+    parser.add_argument("--rollout-size", type=int, default=None,
                         help="transitions de la même politique avant une mise à jour PPO")
-    parser.add_argument("--mini-batch-size", type=int, default=defaults.mini_batch_size,
+    parser.add_argument("--mini-batch-size", type=int, default=None,
                         help="transitions par pas des optimiseurs")
     parser.add_argument("--num-epochs", type=int, default=defaults.num_epochs)
-    parser.add_argument("--actor-lr", type=float, default=defaults.actor_lr)
+    parser.add_argument("--actor-lr", type=float, default=None,
+                        help="learning rate acteur ; remplace aussi celui du checkpoint")
     parser.add_argument("--critic-lr", type=float, default=defaults.critic_lr)
+    parser.add_argument("--entropy-coef", type=float, default=None,
+                        help="bonus d'entropie acteur (défaut : 0 ; reprise : valeur sauvegardée)")
     parser.add_argument("--gamma", type=float, default=defaults.gamma)
     # None permet de distinguer une option absente d'un zéro explicitement
     # demandé, afin de ne pas changer silencieusement la récompense à la reprise.
@@ -54,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     kl_group = parser.add_mutually_exclusive_group()
     kl_group.add_argument("--target-kl", type=float, default=defaults.target_kl)
     kl_group.add_argument("--no-target-kl", dest="target_kl", action="store_const", const=None)
-    parser.add_argument("--parity-atol", type=float, default=defaults.parity_atol,
+    parser.add_argument("--parity-atol", type=float, default=None,
                         help="écart absolu maximal accepté entre logp Python et Unity")
     parser.add_argument("--collect-only", action="store_true",
                         help="vérifie les données et log-probabilités sans optimiser")
@@ -70,6 +74,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="nom de l'expérience (défaut : ppo_AAAAMMJJ-HHMMSS)")
     parser.add_argument("--resume", default=None,
                         help="chemin du checkpoint à reprendre")
+    parser.add_argument("--opponent-checkpoint", default=None,
+                        help="chemin de la snapshot de l'adversaire")
+    parser.add_argument("--opponent-behavior", default="FootSnapshot",
+                        help="comportement Unity de l'adversaire")
     parser.add_argument("--checkpoint-dir", default=None,
                         help="dossier des nouvelles sauvegardes")
     parser.add_argument("--no-tensorboard", action="store_true",
@@ -135,9 +143,38 @@ def main(argv: list[str] | None = None) -> None:
                 "evaluate": args.evaluate,
                 "evaluation_episodes": args.evaluation_episodes,
             })
+        # Une option absente conserve le checkpoint. Une option explicite
+        # remplace son réglage et sera enregistrée dans les prochaines sauvegardes.
+        defaults = PPOTrainerConfig()
+        for name in ("actor_lr", "rollout_size", "mini_batch_size", "parity_atol", "entropy_coef"):
+            value = getattr(args, name)
+            if value is not None:
+                config_values[name] = value
+            elif resume_checkpoint is None:
+                config_values[name] = getattr(defaults, name)
         config = PPOTrainerConfig(**config_values)
     except (ValueError, TypeError, RuntimeError) as error:
         parser.error(str(error))
+
+    if args.opponent_checkpoint is not None:
+        if (
+            not args.opponent_behavior.strip()
+            or args.opponent_behavior == "*"
+            or args.opponent_behavior == config.behavior
+        ):
+            parser.error(
+                "--opponent-behavior doit être non vide, différent de '*' "
+                "et différent de --behavior."
+            )
+        try:
+            opponent = FrozenOpponent(
+                args.opponent_checkpoint,
+                behavior=args.opponent_behavior,
+            )
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+            parser.error(f"Impossible de charger le checkpoint adverse : {error}")
+    else:
+        opponent = None
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(message)s")
@@ -150,10 +187,64 @@ def main(argv: list[str] | None = None) -> None:
         diagnostic_no_jump_tackle=args.diagnostic_no_jump_tackle,
     )
     server = TrainingServer(args.host, args.port, debug=args.verbose)
-    server.on_connect = trainer.on_connect
-    server.on_batch = trainer.on_batch
-    server.on_model_ack = trainer.on_model_ack
-    server.on_disconnect = trainer.on_disconnect
+    logger = logging.getLogger(__name__)
+
+    def on_connect(connection: UnityConnection) -> None:
+        if opponent is None:
+            trainer.on_connect(connection)
+            return
+        if opponent.connection is not None and opponent.connection is not connection:
+            raise RuntimeError("Une autre connexion utilise déjà l'adversaire.")
+        if opponent.connection is connection and (
+            opponent.pending_version is not None
+        ):
+            logger.info("Snapshot adverse déjà envoyée ; attente de son accusé.")
+            return
+        announced_behaviors = {
+            behavior.get("name") for behavior in connection.behaviors
+        }
+        missing_behaviors = {
+            config.behavior,
+            opponent.behavior,
+        } - announced_behaviors
+        if missing_behaviors:
+            logger.info(
+                "Comportements en attente : %s.",
+                ", ".join(sorted(missing_behaviors)),
+            )
+            return
+        if opponent.ready:
+            logger.info("Snapshot adverse prête ; vérification du comportement apprenant.")
+            trainer.on_connect(connection)
+            return
+        logger.info("Envoi de la snapshot adverse %r.", opponent.behavior)
+        opponent.send(connection)
+
+    def on_model_ack(connection: UnityConnection, header: dict[str, object]) -> None:
+        if opponent is None:
+            trainer.on_model_ack(connection, header)
+            return
+        if opponent.on_model_ack(connection, header):
+            logger.info("Snapshot adverse acceptée ; envoi de l'acteur apprenant.")
+            trainer.on_connect(connection)
+        elif opponent.ready and connection is opponent.connection:
+            trainer.on_model_ack(connection, header)
+
+    def on_batch(connection: UnityConnection, batch: Batch) -> None:
+        if opponent is None:
+            trainer.on_batch(connection, batch)
+        elif opponent.ready and connection is opponent.connection:
+            trainer.on_batch(connection, batch)
+
+    def on_disconnect(connection: UnityConnection) -> None:
+        trainer.on_disconnect(connection)
+        if opponent is not None:
+            opponent.on_disconnect(connection)
+
+    server.on_connect = on_connect
+    server.on_batch = on_batch
+    server.on_model_ack = on_model_ack
+    server.on_disconnect = on_disconnect
     mode = (
         "évaluation"
         if config.evaluate
@@ -167,8 +258,14 @@ def main(argv: list[str] | None = None) -> None:
     )
     if resume_checkpoint is not None:
         logging.getLogger(__name__).info(
-            "Reprise : réglages sauvegardés utilisés, sauf device, log_dir, collect_only, evaluate et evaluation_episodes."
+            "Reprise : réglages sauvegardés utilisés, sauf les options de session "
+            "et les remplacements explicites actor-lr, rollout-size, mini-batch-size, parity-atol, entropy-coef."
         )
+    logger.info(
+        "Réglages effectifs : LR acteur=%g, LR critique=%g, cible KL=%s, tolérance logp=%g.",
+        config.actor_lr, config.critic_lr, config.target_kl, config.parity_atol,
+    )
+    logger.info("Coefficient d'entropie acteur : %g.", config.entropy_coef)
     if config.ball_approach_shaping > 0:
         logging.getLogger(__name__).info(
             "Shaping joueur-ballon : alpha=%g, gamma=%g. %s "
