@@ -62,5 +62,9 @@ def export_actor(actor: PPOActorNetwork) -> tuple[ModelExport, DecoderExport]:
         log_std=decoder_log_std,
         deterministic=False,
     )
+    # Type explicite : un ancien pont doit refuser le modèle plutôt que calculer
+    # silencieusement log(1-p) avec une précision insuffisante sur les boutons.
+    # Le décodeur direct historique reste disponible pour les autres algorithmes.
+    decoder_export.spec["type"] = "direct_logits"
 
     return model_export, decoder_export

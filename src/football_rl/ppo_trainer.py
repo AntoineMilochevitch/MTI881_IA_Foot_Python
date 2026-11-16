@@ -784,10 +784,13 @@ class PPOUnityTrainer:
             self.trained_transitions += sample_count
             for entry in self.last_history:
                 logger.info(
-                    "Cycle %d / époque %d : acteur=%.5f critique=%.5f "
-                    "KL=%.5g clip=%.3f ratio=%.5f arrêt_KL=%s.",
-                    self.update_count, entry["epoch"], entry["actor_loss"], entry["critic_loss"],
+                    "Cycle %d / époque %d : acteur=%s critique=%.5f "
+                    "KL=%.5g clip=%.3f ratio=%.5f arrêt_KL=%s ; pas acteur=%d, critique=%d.",
+                    self.update_count, entry["epoch"],
+                    f'{entry["actor_loss"]:.5f}' if entry["num_updates"] else "figé",
+                    entry["critic_loss"],
                     entry["approx_kl"], entry["clip_fraction"], entry["ratio_mean"], entry["kl_limit_reached"],
+                    entry["num_updates"], entry["critic_num_updates"],
                 )
             logger.info("Entraînement terminé en %.2f s ; %d transitions entraînées, %d ignorées au total.",
                         perf_counter() - start, self.trained_transitions, self.ignored_transitions)

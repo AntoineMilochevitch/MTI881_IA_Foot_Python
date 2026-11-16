@@ -83,13 +83,21 @@ Lors d'une vraie fin, comme un but, il n'y a plus de valeur future à ajouter. L
 | Loss critique | Mesure l'écart entre la valeur prédite et la cible construite à partir des récompenses et du GAE. |
 | Ratio PPO | Probabilité de l'action avec le nouvel acteur, divisée par sa probabilité avec l'ancien. À 1, elle n'a pas changé. |
 | Clipping | Limite l'intérêt de modifier trop fortement ce ratio. Avec `0,2`, la zone de référence est `[0,8 ; 1,2]`. Ce n'est pas une limite stricte sur les poids. |
-| KL | Mesure à quel point la politique a changé sur les observations du rollout. Si elle dépasse la cible, on arrête les époques restantes. |
+| KL | Mesure à quel point la politique a changé sur les observations du rollout. Si elle dépasse la cible, on arrête les mises à jour de l'acteur ; le critique continue. |
 
 Une **époque** est un passage sur le rollout, découpé en mini-lots. Plusieurs époques réutilisent ces mêmes données, puis un nouveau rollout est collecté.
 
 Les réglages par défaut sont : rollout `2048`, mini-lot `128`, maximum `4` époques, learning rates acteur/critique `0,0003`, `gamma = 0,99`, `gae_lambda = 0,95`, clipping `0,2` et cible KL `0,01`. Les commandes plus bas utilisent un rollout de `512`.
 
-La KL est mesurée sur tout le rollout après chaque mini-lot. Dès que la cible est dépassée, le cycle d'optimisation s'arrête, même au milieu d'une époque. Le dernier pas reste appliqué, donc la cible peut être légèrement dépassée. Ce contrôle ajoute des calculs. `ppo/epochs_done` compte les époques commencées et `ppo/optimizer_steps` donne le nombre réel de pas Adam du cycle.
+La KL est mesurée sur tout le rollout après chaque mise à jour de l'acteur. Dès que la cible est dépassée, **l'acteur reste figé jusqu'au prochain rollout**, y compris son optimiseur Adam. Le dernier pas reste appliqué, donc la cible peut être légèrement dépassée.
+
+**Le critique termine les quatre époques prévues** (ou la valeur de `--num-epochs`). Ses poids sont séparés de ceux de l'acteur : il peut continuer à apprendre sans changer la politique. Les cibles GAE et les avantages sont calculés une seule fois avant l'optimisation, puis restent fixes pendant tout le cycle.
+
+Exemple : si la KL dépasse la cible au deuxième mini-lot de la première époque, l'acteur fait deux mises à jour au total. Le critique traite quand même tous les mini-lots des quatre époques. Les logs affichent ensuite `acteur=figé`.
+
+`ppo/epochs_done` compte les époques où l'acteur a travaillé (même partiellement), et `ppo/optimizer_steps` ses pas Adam. `ppo/critic_epochs_done` et `ppo/critic_optimizer_steps` donnent les compteurs du critique. Les losses acteur affichées restent celles de sa dernière époque active, pas des zéros ajoutés après son arrêt.
+
+La **variance expliquée** mesure si le critique distingue les situations aux retours élevés de celles aux retours faibles : `1 - Var(cible - prédiction) / Var(cible)`. Proche de 1, il explique bien leurs différences ; proche de 0, il ne fait pas mieux qu'une prédiction constante sur ce critère ; négative, ses erreurs varient davantage que les cibles. Elle est mesurée sur tout le rollout avant/après l'optimisation, avec les mêmes cibles. Ce n'est pas une mesure de généralisation ni un score de football. Elle ignore un biais constant : regarder aussi la MSE. Si les cibles sont presque constantes, la variance expliquée n'est pas définie et le point n'est pas écrit (`*_defined = 0`).
 
 ## 4. Récompenses et shaping : la différence
 
@@ -233,9 +241,19 @@ Pour reprendre l'essai contre la snapshot avec 32 terrains, un LR acteur de `1e-
 python -m football_rl.ppo_unity --device cuda --resume checkpoints/snapshot_v1_lr_1e4/latest.pt --actor-lr 0.0001 --rollout-size 2048 --mini-batch-size 256 --parity-atol 0.0005 --opponent-checkpoint checkpoints/snapshots/adversaire_v1.pt --opponent-behavior FootSnapshot --run-name snapshot_v1_lr_1e4_rollout2048
 ```
 
-La tolérance `5e-4` accepte l'écart observé de `1,38e-4` entre Python et Unity. C'est un assouplissement du contrôle numérique dont la cause exacte reste à confirmer. Un écart accepté supérieur à `1e-4` produit un avertissement. Un dépassement de la tolérance arrête la collecte et sauvegarde les poids et le lot dans `parity_failure.pt`, dans le dossier des checkpoints du run, pour reproduire le problème.
+Python et Unity calculent maintenant les log-probabilités des boutons directement depuis les logits (`direct_logits`). L'ancien calcul `log(1 - p)` perdait de la précision lorsque `p` était presque égal à 1 : une rare action « ne pas sauter » pouvait arrêter l'évaluation ou l'entraînement. Le contrôle de parité reste actif ; augmenter sa tolérance ne corrige pas cette cause. Un dépassement sauvegarde le lot et les poids dans `parity_failure.pt`.
+
+Cette correction nécessite aussi la version Unity du décodeur `direct_logits` dans `Policy.cs`. Arrêter Play et le serveur Python, laisser Unity compiler, puis relancer les deux. Les checkpoints existants restent utilisables, sans repartir de zéro. Un ancien pont refuse explicitement ce nouveau décodeur. Pour recommencer une évaluation interrompue, choisir un nouveau `--run-name` afin de séparer ses statistiques du résultat incomplet.
 
 Un checkpoint est enregistré après chaque cycle réussi, avec une archive tous les dix cycles. La partie Unity et le rollout incomplet ne sont pas sauvegardés. Une déconnexion conserve les réseaux en mémoire tant que Python reste ouvert, mais abandonne la collecte incomplète.
+
+Essai avec le critique qui termine ses époques : reprendre l'archive à **10 408 415 transitions**, proche de la référence évaluée à 10,4 M (le checkpoint exact évalué à 10 427 710 n'a pas été archivé). Le nouveau nom sépare cet essai des anciennes courbes ; les adversaires et réglages Unity restent identiques.
+
+```powershell
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/mixed_reference_10m_lr5e5/cycle_007440.pt --actor-lr 0.00005 --opponent FootSnapshotOld checkpoints/snapshots/adversaire_v1.pt --opponent FootSnapshotRecent checkpoints/snapshots/mix_recent_9263696.pt --run-name mixed_critic_full_10m4
+```
+
+Les anciens checkpoints restent compatibles. Après environ 200 000 à 300 000 nouvelles transitions, évaluer ce nouvel essai contre les mêmes adversaires. Une amélioration de l'ajustement du critique ne garantit pas une amélioration sportive.
 
 ### Évaluer sans apprendre
 
@@ -294,7 +312,9 @@ Ouvrir <http://localhost:6006>. Observer les tendances sur plusieurs milliers de
 | `approach/episodes_with_kick_opportunity_fraction` | Part des épisodes sportifs complets suivis où une occasion de frappe a existé. Une occasion n'est pas un contact réel. |
 | `reward/environment_mean`, `reward/shaping_mean`, `reward/training_mean` | Récompense Unity, ajout du shaping et somme utilisée pour apprendre, **par transition**. |
 | `loss/critic` | Qualité d'ajustement des valeurs aux cibles du rollout. Une petite loss ne prouve pas que le joueur est bon. |
-| `ppo/approx_kl`, `ppo/epochs_done` | Ampleur du changement de politique et nombre d'époques réellement effectuées. Des arrêts KL fréquents invitent à examiner le learning rate. |
+| `critic/explained_variance_before`, `critic/explained_variance_after` | Part de la variation des cibles expliquée avant/après les mises à jour, sur le même rollout. À lire avec `critic/mse_before` et `critic/mse_after`. |
+| `ppo/approx_kl`, `ppo/epochs_done` | Ampleur du changement de politique et nombre d'époques commencées par l'acteur. La limite KL ne stoppe plus le critique. |
+| `ppo/optimizer_steps`, `ppo/critic_optimizer_steps`, `ppo/critic_epochs_done` | Nombre réel de pas Adam acteur/critique et nombre d'époques terminées par le critique. |
 | `ppo/clip_fraction` | Part des ratios hors de la zone de clipping. Une valeur élevée indique des changements importants, pas de meilleures actions. |
 | `exploration/std_move_x`, `exploration/std_move_z` | Dispersion des actions de déplacement. Leur baisse ne suffit pas à démontrer une progression. |
 | `exploration/entropy_continuous`, `exploration/entropy_binary`, `exploration/entropy_total` | Diversité des quatre commandes continues, des trois boutons et leur somme, après optimisation sur les observations du rollout. |

@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import asdict, is_dataclass
 import json
 import logging
+import math
 import statistics
 from typing import Any
 
@@ -50,23 +51,36 @@ class PPOTensorBoardLogger:
             if not history:
                 return
             last = history[-1]
+            # Après l'arrêt KL, les dernières époques peuvent ne concerner que
+            # le critique. Garder la dernière vraie loss acteur, pas un zéro.
+            actor_history = [entry for entry in history if entry["num_updates"] > 0]
+            last_actor = actor_history[-1]
             scalars = {
-                "loss/actor": last["actor_loss"],
+                "loss/actor": last_actor["actor_loss"],
                 "loss/critic": last["critic_loss"],
-                "grad/actor_norm": last["actor_grad_norm"],
+                "grad/actor_norm": last_actor["actor_grad_norm"],
                 "grad/critic_norm": last["critic_grad_norm"],
                 "ppo/approx_kl": last["approx_kl"],
                 "ppo/clip_fraction": last["clip_fraction"],
                 "ppo/ratio_mean": last["ratio_mean"],
-                "ppo/epochs_done": len(history),
+                "ppo/epochs_done": len(actor_history),
                 "ppo/optimizer_steps": sum(entry["num_updates"] for entry in history),
+                "ppo/critic_epochs_done": len(history),
+                "ppo/critic_optimizer_steps": sum(
+                    entry.get("critic_num_updates", entry["num_updates"]) for entry in history),
                 "ppo/kl_limit_reached": float(last["kl_limit_reached"])
             }
             scalars.update(extras or {})
             # Disponibles pour les nouveaux entraînements, même avec coef=0.
             for name in ("actor_policy_loss", "entropy_bonus"):
-                if name in last:
-                    scalars[f"loss/{name}"] = last[name]
+                if name in last_actor:
+                    scalars[f"loss/{name}"] = last_actor[name]
+            for name, value in last.items():
+                if name.startswith("critic/"):
+                    if "explained_variance" in name:
+                        scalars[name + "_defined"] = float(math.isfinite(value))
+                    if math.isfinite(value):
+                        scalars[name] = value
             self._write(step, scalars)
         except Exception:
             logger.warning("Suivi TensorBoard : cycle non enregistré.", exc_info=True)

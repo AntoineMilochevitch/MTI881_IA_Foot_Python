@@ -147,6 +147,7 @@ def update_minibatch(
     clip_epsilon: float,
     max_grad_norm: float,
     entropy_coef: float = 0.0,
+    update_actor: bool = True,
 ) -> dict[str, float]:
     """Met à jour les réseaux de l'acteur et du critique pour un mini-batch donné.
 
@@ -164,6 +165,8 @@ def update_minibatch(
         paramètre de clipping pour PPO
     max_grad_norm :
         norme maximale des gradients pour le clipping
+    update_actor :
+        False après l'arrêt KL : seul le critique continue à apprendre.
     """
     
     if not math.isfinite(entropy_coef) or entropy_coef < 0:
@@ -172,23 +175,22 @@ def update_minibatch(
     actor_optimizer.zero_grad()
     critic_optimizer.zero_grad()
     
-    new_log_probs = actor.evaluate_action(mini_batch["obs"], mini_batch["actions"])
-    
     predicted_values = critic(mini_batch["obs"])["value"]
-    
-    actor_policy_loss = compute_actor_loss(
-        new_log_probs=new_log_probs,
-        old_log_probs=mini_batch["old_log_probs"],
-        advantages=mini_batch["advantages"],
-        clip_epsilon=clip_epsilon
-    )
-    
-    # Minimiser L_PPO - coef * H encourage la diversité des actions.
-    # Ce terme régularise l'acteur ; les cibles du critique utilisent les
-    # récompenses du rollout et leur shaping habituel.
-    entropy = actor.evaluate_entropy(mini_batch["obs"])["total"].mean()
-    entropy_bonus = entropy_coef * entropy
-    actor_loss = actor_policy_loss - entropy_bonus
+
+    # Les zéros servent seulement à agréger les résultats. Aucune loss acteur
+    # n'est affichée pour une époque où il n'a pas été entraîné.
+    actor_loss = actor_policy_loss = entropy_bonus = predicted_values.new_zeros(())
+    actor_grad_norm = predicted_values.new_zeros(())
+    if update_actor:
+        new_log_probs = actor.evaluate_action(mini_batch["obs"], mini_batch["actions"])
+        actor_policy_loss = compute_actor_loss(
+            new_log_probs, mini_batch["old_log_probs"],
+            mini_batch["advantages"], clip_epsilon
+        )
+        # Le bonus d'entropie agit uniquement sur l'acteur.
+        entropy = actor.evaluate_entropy(mini_batch["obs"])["total"].mean()
+        entropy_bonus = entropy_coef * entropy
+        actor_loss = actor_policy_loss - entropy_bonus
 
     critic_loss = compute_critic_loss(
         predicted_values=predicted_values,
@@ -199,17 +201,22 @@ def update_minibatch(
     if not torch.isfinite(actor_loss) or not torch.isfinite(critic_loss):
         raise ValueError("Les pertes PPO doivent être finies.")
     
-    actor_loss.backward()
+    if update_actor:
+        actor_loss.backward()
     critic_loss.backward()
     
-    actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-        actor.parameters(), max_grad_norm, error_if_nonfinite=True
-    )
+    if update_actor:
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+            actor.parameters(), max_grad_norm, error_if_nonfinite=True
+        )
     critic_grad_norm = torch.nn.utils.clip_grad_norm_(
         critic.parameters(), max_grad_norm, error_if_nonfinite=True
     )
     
-    actor_optimizer.step()
+    # Ne pas appeler Adam sur l'acteur figé : ses moments et son compteur
+    # doivent eux aussi rester inchangés jusqu'au prochain rollout.
+    if update_actor:
+        actor_optimizer.step()
     critic_optimizer.step()
     
     return {
@@ -279,6 +286,10 @@ def train_ppo_epochs(
         raise ValueError("Les données d'entraînement sont vides.")
     
     history = []
+    critic_before = evaluate_critic_on_rollout(critic, training_data, mini_batch_size)
+    # Cet état persiste entre les époques du même rollout, puis est réinitialisé
+    # au prochain cycle. La KL de l'acteur ne décide pas du budget du critique.
+    kl_limit_reached = False
     
     for epoch in range(num_epochs):
         critic_sum_loss = 0.0
@@ -289,8 +300,10 @@ def train_ppo_epochs(
         actor_grad_norm_sum = 0.0
         transition_count = 0
         update_count = 0
-        kl_limit_reached = False
+        actor_transition_count = 0
+        actor_update_count = 0
         for mini_batch in iterate_mini_batches(training_data, mini_batch_size):
+            update_actor = not kl_limit_reached
             loss_info = update_minibatch(
                 actor=actor,
                 critic=critic,
@@ -300,6 +313,7 @@ def train_ppo_epochs(
                 clip_epsilon=clip_epsilon,
                 max_grad_norm=max_grad_norm,
                 entropy_coef=entropy_coef,
+                update_actor=update_actor,
             )
             batch_size = len(mini_batch["obs"])
             critic_sum_loss += batch_size * loss_info["critic_loss"]
@@ -310,18 +324,21 @@ def train_ppo_epochs(
             actor_grad_norm_sum += loss_info["actor_grad_norm"]
             transition_count += batch_size
             update_count += 1
+            if update_actor:
+                actor_transition_count += batch_size
+                actor_update_count += 1
 
             # Mesurer sur tout le rollout évite de décider à partir du bruit
             # d'un seul mini-lot. Arrêter dès le premier pas qui franchit la
             # cible évite de poursuivre jusqu'à la fin de l'époque.
             # Le dernier pas reste appliqué : target_kl est une cible d'arrêt.
-            if target_kl is not None:
+            if target_kl is not None and update_actor:
                 policy_metrics = evaluate_policy_on_rollout(
                     actor, training_data, clip_epsilon, mini_batch_size
                 )
                 kl_limit_reached = policy_metrics["approx_kl"] > target_kl
-                if kl_limit_reached:
-                    break
+                # Pas de break : les mini-lots suivants entraînent encore
+                # le critique avec les mêmes cibles GAE, calculées avant le cycle.
 
         if target_kl is None:
             policy_metrics = evaluate_policy_on_rollout(
@@ -330,24 +347,59 @@ def train_ppo_epochs(
 
         history.append({
             "epoch": epoch + 1,
-            "actor_loss": actor_sum_loss / transition_count,
-            "actor_policy_loss": actor_policy_sum_loss / transition_count,
-            "entropy_bonus": entropy_bonus_sum / transition_count,
+            "actor_loss": actor_sum_loss / max(actor_transition_count, 1),
+            "actor_policy_loss": actor_policy_sum_loss / max(actor_transition_count, 1),
+            "entropy_bonus": entropy_bonus_sum / max(actor_transition_count, 1),
             "critic_loss": critic_sum_loss / transition_count,
-            "actor_grad_norm": actor_grad_norm_sum / update_count,
+            "actor_grad_norm": actor_grad_norm_sum / max(actor_update_count, 1),
             "critic_grad_norm": critic_grad_norm_sum / update_count,
-            "num_samples": transition_count,
-            "num_updates": update_count,
+            # Les anciens compteurs restent ceux de l'acteur, pour comparer
+            # les courbes aux runs précédents. Le critique a ses compteurs.
+            "num_samples": actor_transition_count,
+            "num_updates": actor_update_count,
+            "critic_num_samples": transition_count,
+            "critic_num_updates": update_count,
             "approx_kl": policy_metrics["approx_kl"],
             "clip_fraction": policy_metrics["clip_fraction"],
             "ratio_mean": policy_metrics["ratio_mean"],
             "kl_limit_reached": kl_limit_reached
         })
 
-        if kl_limit_reached:
-            break
-    
+    critic_after = evaluate_critic_on_rollout(critic, training_data, mini_batch_size)
+    for when, metrics in (("before", critic_before), ("after", critic_after)):
+        for name, value in metrics.items():
+            history[-1][f"critic/{name}_{when}"] = value
+
     return history
+
+
+@torch.no_grad()
+def evaluate_critic_on_rollout(
+    critic: PPOValueNetwork,
+    training_data: dict[str, torch.Tensor],
+    mini_batch_size: int,
+) -> dict[str, float]:
+    """Compare V(s) aux mêmes cibles avant/après, sur tout le rollout.
+
+    EV = 1 - Var(cible - prédiction) / Var(cible).
+    On ne moyenne pas des variances calculées mini-lot par mini-lot.
+    C'est une mesure d'ajustement aux cibles GAE, pas une évaluation sportive.
+    """
+    predictions = torch.cat([
+        critic(obs)["value"].detach().cpu()
+        for obs in training_data["obs"].split(mini_batch_size)
+    ]).double()
+    targets = training_data["returns"].detach().cpu().double()
+    mse = compute_critic_loss(predictions, targets)
+    if not torch.isfinite(predictions).all() or not torch.isfinite(targets).all():
+        raise ValueError("Les valeurs et les cibles du critique doivent être finies.")
+    variance = targets.var(correction=0).item()
+    # Sans variation des cibles, EV n'a pas de sens. Le logger omet alors
+    # ce point et publie un indicateur de validité plutôt qu'un faux zéro.
+    explained = (1.0 - (targets - predictions).var(correction=0).item() / variance
+                 if variance > 1e-12 else float("nan"))
+    return {"explained_variance": explained, "mse": mse.item(),
+            "target_variance": variance}
 
 def compute_policy_metrics(
     new_log_probs: torch.Tensor,

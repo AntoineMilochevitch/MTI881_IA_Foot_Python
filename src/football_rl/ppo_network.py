@@ -160,10 +160,13 @@ class PPOActorNetwork(FootballNetwork):
         # Actions continues : (B, 4)
         log_prob_continuous = normal_dist.log_prob(continuous_actions)
 
-        # Actions binaires : (B, 3) - Convention Unity
-        p = bernoulli_dist.probs
-        q = torch.where(binary_actions == 1, p, 1.0 - p)
-        log_prob_binary = torch.log(q.clamp(min=1e-8))
+        # Actions binaires : calcul depuis les logits, comme direct_logits dans Unity.
+        # log(1 - sigmoid(logit)) perd de la précision quand p approche 1
+        # (ex. ne pas sauter alors que le saut est très probable).
+        # log P(a=1) = -softplus(-logit), log P(a=0) = -softplus(logit).
+        signed_logits = torch.where(binary_actions == 1,
+                                    -bernoulli_dist.logits, bernoulli_dist.logits)
+        log_prob_binary = -torch.nn.functional.softplus(signed_logits)
 
         # Log-probabilité totale : (B,)
         return log_prob_continuous.sum(dim=-1) + log_prob_binary.sum(dim=-1)

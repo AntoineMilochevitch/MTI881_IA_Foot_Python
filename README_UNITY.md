@@ -227,6 +227,15 @@ binaires sont ignorées. Les tirages continus sont conservés avant le bornage d
 moteur. La log-probabilité inclut chaque composante, même puissance et effet
 lorsqu'aucune frappe n'est déclenchée.
 
+La variante `direct_logits` utilise le même espace d'actions mais calcule les
+log-probabilités binaires depuis les logits : `-softplus(-logit)` pour un bouton
+appuyé et `-softplus(logit)` sinon. Cela évite la perte de précision de `log(1-p)`
+sur une action rare lorsque `p` est proche de 1. Pour l'utiliser, définir
+`decoder.spec["type"] = "direct_logits"` après `direct_decoder(...)` ; cette
+variante nécessite le pont Unity mis à jour. Le type historique `direct` reste
+inchangé pour les autres clients. Un ancien pont rejette le nouveau type au
+chargement plutôt que de calculer silencieusement une log-probabilité différente.
+
 L'envoi utilise `connection.send_model(model, version=..., behavior=..., decoder=...)`.
 Un export avec un exemple de contrôle permet à Unity de comparer sa sortie à
 celle attendue avant de l'installer. Ce contrôle porte sur le modèle ; un
