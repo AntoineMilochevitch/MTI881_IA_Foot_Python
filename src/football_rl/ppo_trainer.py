@@ -18,13 +18,14 @@ from iafoot import Batch, UnityConnection
 from football_rl.ppo_buffer import PPORolloutBuffer
 from football_rl.ppo_checkpoint import (
     build_checkpoint,
+    checkpoint_hidden_size,
     restore_networks,
     restore_optimizers,
     save_checkpoint,
     validate_schema,
 )
 from football_rl.ppo_export import export_actor
-from football_rl.ppo_network import PPOActorNetwork, PPOValueNetwork
+from football_rl.ppo_network import DEFAULT_HIDDEN_SIZE, PPOActorNetwork, PPOValueNetwork
 from football_rl.ppo_training import compute_policy_metrics, train_ppo
 from football_rl.unity import ACTION_SCHEMA
 from football_rl.ppo_logging import PPOTensorBoardLogger
@@ -326,8 +327,13 @@ class PPOUnityTrainer:
                 with torch.random.fork_rng(devices=[]):
                     # Initialisation CPU sans modifier le RNG CUDA de l'appelant.
                     torch.random.default_generator.manual_seed(self.seed)
-                    actor = PPOActorNetwork(observation_size).to(self.device)
-                    critic = PPOValueNetwork(observation_size).to(self.device)
+                    # Nouveau run : 256. Reprise : dimensions propres au checkpoint.
+                    actor_width = (checkpoint_hidden_size(pending_checkpoint, "actor")
+                                   if pending_checkpoint is not None else DEFAULT_HIDDEN_SIZE)
+                    critic_width = (checkpoint_hidden_size(pending_checkpoint, "critic")
+                                    if pending_checkpoint is not None else DEFAULT_HIDDEN_SIZE)
+                    actor = PPOActorNetwork(observation_size, actor_width).to(self.device)
+                    critic = PPOValueNetwork(observation_size, critic_width).to(self.device)
                 actor_optimizer = torch.optim.Adam(actor.parameters(), lr=self.actor_lr)
                 critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.critic_lr)
                 if pending_checkpoint is not None:
@@ -353,6 +359,8 @@ class PPOUnityTrainer:
                 self.actor, self.critic = actor, critic
                 self.actor_optimizer, self.critic_optimizer = actor_optimizer, critic_optimizer
                 logger.info("LR effectif dans Adam acteur : %g.", actor_optimizer.param_groups[0]["lr"])
+                logger.info("Architecture : acteur %d x %d, critique %d x %d.",
+                            actor.hidden_size, actor.hidden_size, critic.hidden_size, critic.hidden_size)
 
             self.schema = schema
             self.session_id = session_id

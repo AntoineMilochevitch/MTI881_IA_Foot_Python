@@ -35,6 +35,10 @@ def build_checkpoint(
     config["device"] = str(config["device"])
     return {
         "format_version": _FORMAT_VERSION,
+        # Métadonnées indépendantes de la CLI. Les anciens checkpoints n'ont
+        # pas ce champ : leurs dimensions seront lues directement dans les poids.
+        "architecture": {"actor_hidden_size": actor.hidden_size,
+                         "critic_hidden_size": critic.hidden_size},
         "actor_state_dict": actor.state_dict(),
         "critic_state_dict": critic.state_dict(),
         "actor_optimizer_state_dict": actor_optimizer.state_dict(),
@@ -90,6 +94,27 @@ def load_checkpoint(path: str) -> dict[str, object]:
 
     return checkpoint
 
+
+
+def checkpoint_hidden_size(checkpoint: dict[str, object], network: str) -> int:
+    """Retrouve la largeur à construire AVANT de charger les poids et Adam.
+
+    Aucun agrandissement des anciens poids : un modèle 128 reste un modèle 128.
+    Le nouveau modèle 256 et une ancienne snapshot 128 peuvent ainsi coexister.
+    """
+    if network not in ("actor", "critic"):
+        raise ValueError("network doit valoir actor ou critic.")
+    weight = checkpoint[f"{network}_state_dict"]["network.0.weight"]
+    if not isinstance(weight, torch.Tensor) or weight.ndim != 2 or weight.shape[0] <= 0:
+        raise ValueError(f"Première couche du réseau {network} invalide.")
+    width = weight.shape[0]
+    architecture = checkpoint.get("architecture", {})
+    if not isinstance(architecture, dict):
+        raise ValueError("Les métadonnées architecture doivent être un dictionnaire.")
+    declared = architecture.get(f"{network}_hidden_size", width)
+    if isinstance(declared, bool) or not isinstance(declared, int) or declared != width:
+        raise ValueError(f"Architecture {network} incompatible avec les poids sauvegardés.")
+    return width
 
 
 def restore_networks(checkpoint: dict[str, object], actor: PPOActorNetwork, critic: PPOValueNetwork) -> None:

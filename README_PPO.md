@@ -24,7 +24,9 @@ PPO est **model-free** : il n'apprend pas à simuler la physique. Il est **on-po
 
 Le schéma actuel contient **46 observations** : informations sur le joueur, le ballon, les autres joueurs et le match. Unity les prépare et les normalise. L'ordre et le détail des observations sont décrits dans le README général ; Python lit le schéma envoyé par le pont.
 
-L'acteur et le critique ont chacun deux couches cachées de **128 neurones**, avec des activations `Tanh`.
+Les nouveaux acteurs et critiques ont chacun deux couches cachées de **256 neurones**, avec des activations `Tanh`. Cette taille est définie dans le code, sans option de commande. Avec 46 observations : acteur `46 → 256 → 256 → 7`, critique `46 → 256 → 256 → 1`.
+
+Les anciens checkpoints et snapshots restent en **128 × 128** : leur taille est retrouvée dans les poids avant chargement. Les nouveaux checkpoints enregistrent aussi leur architecture. Un acteur apprenant en 256 peut donc jouer contre une snapshot en 128. Reprendre un ancien checkpoint ne l'agrandit pas ; pour le nouveau réseau, commencer **sans `--resume`**.
 
 L'acteur produit les paramètres de sept commandes :
 
@@ -188,6 +190,22 @@ python -m football_rl.ppo_unity --device cuda --resume checkpoints/snapshots/adv
 
 Avec 32 terrains en 1 contre 1, attendre deux comportements et 64 agents dans `hello`, puis des batchs `Foot` seulement. Une fois le diagnostic validé, retirer `--collect-only` et choisir un nouveau nom de run pour l'entraînement avec ces nouveaux départs.
 
+### Mélange : 16 bots + 16 snapshots du modèle 128 à 12 M
+
+L'acteur 256 continue d'apprendre sur les 32 joueurs bleus. Les rouges sont répartis entre **16 bots Unity et 16 copies figées du modèle 128**, sauvegardé à 12 162 503 transitions. Seul le bleu enregistre des expériences ; le modèle adverse n'est jamais mis à jour.
+
+Hors Play, conserver un joueur actif dans chaque équipe et un composant `FootAgent` sur chacun (celui du rouge peut être désactivé avant Play). Dans **IA Foot > Entraînement parallèle > Configurer le mélange 16 bots + 16 snapshots**, le menu active `ArenaOpponentMix`, règle 32 terrains, `Clone Scene Arena`, `Bot Arena Count = 16` et `Old Snapshot Arena Count = 16`. Il ne reste donc aucun terrain pour `FootSnapshotRecent`. Conserver les apparitions aléatoires et les récompenses actuelles, puis sauvegarder la scène sans appliquer ces réglages au prefab partagé.
+
+```powershell
+python -m football_rl.ppo_unity --device cuda --resume checkpoints/solo_256_vers_bot_random/latest.pt --opponent FootSnapshotOld checkpoints/snapshots/reference_128_12162503.pt --run-name mixed_256_bot_128_12m
+```
+
+Attendre **2 comportements et 48 agents PPO** : 32 bleus `Foot` et 16 rouges `FootSnapshotOld`. Les 16 bots sont contrôlés localement. Python installe la snapshot avant l'apprenant. Les poids et optimiseurs de l'apprenant sont repris ; les hyperparamètres restent inchangés. Pour un diagnostic sans apprentissage, ajouter `--collect-only --verbose`.
+
+Pour reprendre ensuite ce nouveau run, utiliser `--resume checkpoints/mixed_256_bot_128_12m/latest.pt`, avec le même nom de run et la même option `--opponent`. La snapshot de référence reste fixe.
+
+Suivre séparément `opponents/bot/sport/*` et `opponents/snapshot_old/sport/*`. Une répartition 16/16 des terrains ne garantit pas autant d'épisodes terminés contre chaque adversaire. Pour comparer les progrès au bilan précédent, conserver des évaluations séparées contre le bot, avec les mêmes apparitions aléatoires.
+
 ### Mélange d'adversaires : 16 bots + 8 anciennes snapshots + 8 récentes
 
 Un seul acteur et un seul critique apprennent à partir des **32 joueurs bleus `Foot`**. Les rouges restent fixes : 16 `SimpleBotInput`, 8 `FootSnapshotOld` et 8 `FootSnapshotRecent`. Les adversaires n'enregistrent aucune transition. C'est un mélange fixe, pas une ligue avec remplacement automatique des adversaires.
@@ -224,6 +242,14 @@ python -m football_rl.ppo_unity --device cuda --rollout-size 512 --ball-approach
 ```
 
 Choisir un **nom encore inutilisé**, puis lancer **Play** dans Unity. Sans `--resume`, les réseaux repartent de zéro. Remplacer `cuda` par `cpu` si nécessaire.
+
+Pour l'essai **256 × 256 depuis zéro**, commencer en solo avec apparitions aléatoires. Hors Play, désactiver `ArenaOpponentMix`, désactiver le GameObject adverse et garder l'apprenant `Foot` avec `Record Experience`. Sur les terrains dupliqués, garder `Clone Scene Arena` coché. Conserver les observations, récompenses et règles du jeu ; mettre `Distance To Ball Per Second` à `0` puisque le shaping Python est actif.
+
+```powershell
+python -m football_rl.ppo_unity --device cuda --actor-lr 0.0001 --critic-lr 0.0003 --entropy-coef 0.001 --ball-approach-shaping 0.1 --rollout-size 2048 --mini-batch-size 256 --run-name solo_256_random_scratch
+```
+
+Le LR acteur `0,0001` est un point de départ pour l'apprentissage, pas un réglage d'exploration. Le bonus d'entropie `0,001` encourage à conserver la diversité des actions ; les écarts-types initiaux restent à `0,5`. Le démarrage affiche `Architecture : acteur 256 x 256, critique 256 x 256`. Ce choix n'est pas une garantie de meilleure performance : comparer ensuite aux anciens modèles contre les mêmes adversaires, avec les mêmes conditions de départ.
 
 ### Reprendre le run existant
 

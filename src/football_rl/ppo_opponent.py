@@ -4,7 +4,7 @@ import logging
 import torch
 from iafoot import UnityConnection
 
-from football_rl.ppo_checkpoint import load_checkpoint
+from football_rl.ppo_checkpoint import load_checkpoint, checkpoint_hidden_size
 from football_rl.ppo_export import export_actor
 from football_rl.ppo_network import PPOActorNetwork
 
@@ -15,7 +15,8 @@ class FrozenOpponent:
         schema = checkpoint["schema"]
 
         with torch.random.fork_rng(devices=[]):
-            actor = PPOActorNetwork(observation_size=int(schema[0]))
+            actor = PPOActorNetwork(observation_size=int(schema[0]),
+                                    hidden_size=checkpoint_hidden_size(checkpoint, "actor"))
 
         actor.load_state_dict(checkpoint["actor_state_dict"])
         actor.eval()

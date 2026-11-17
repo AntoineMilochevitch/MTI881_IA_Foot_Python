@@ -18,6 +18,10 @@ from torch.distributions import Normal, Bernoulli
 
 from football_rl.network import FootballNetwork
 
+# Taille des NOUVEAUX réseaux. 
+# À la reprise, on utilise la largeur du checkpoint, même s'il date du modèle 128.
+DEFAULT_HIDDEN_SIZE = 256
+
 
 class PPOValueNetwork(FootballNetwork):
     """Estime V(s), le retour actualisé attendu sous la politique courante.
@@ -26,17 +30,20 @@ class PPOValueNetwork(FootballNetwork):
     entraîné en Python à partir de cibles construites avec les trajectoires.
     """
 
-    def __init__(self, observation_size: int) -> None:
+    def __init__(self, observation_size: int, hidden_size: int = DEFAULT_HIDDEN_SIZE) -> None:
         super().__init__(observation_size)
+        if isinstance(hidden_size, bool) or not isinstance(hidden_size, int) or hidden_size <= 0:
+            raise ValueError("hidden_size doit être un entier strictement positif.")
+        self.hidden_size = hidden_size
 
         # Les deux couches cachées apprennent des combinaisons d'observations.
         # La sortie linéaire permet des retours négatifs ou supérieurs à 1.
         self.network = nn.Sequential(
-            nn.Linear(observation_size, 128),
+            nn.Linear(observation_size, hidden_size),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(hidden_size, hidden_size),
             nn.Tanh(),
-            nn.Linear(128, 1)
+            nn.Linear(hidden_size, 1)
         )
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -68,16 +75,19 @@ class PPOActorNetwork(FootballNetwork):
     CONTINUOUS_INDICES = [0, 1, 3, 4]
     BINARY_INDICES = [2, 5, 6]
 
-    def __init__(self, observation_size: int) -> None:
+    def __init__(self, observation_size: int, hidden_size: int = DEFAULT_HIDDEN_SIZE) -> None:
         super().__init__(observation_size)
+        if isinstance(hidden_size, bool) or not isinstance(hidden_size, int) or hidden_size <= 0:
+            raise ValueError("hidden_size doit être un entier strictement positif.")
+        self.hidden_size = hidden_size
 
         # Un seul MLP produit les sept paramètres dépendant de l'état.
         self.network = nn.Sequential(
-            nn.Linear(observation_size, 128),
+            nn.Linear(observation_size, hidden_size),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(hidden_size, hidden_size),
             nn.Tanh(),
-            nn.Linear(128, 7)
+            nn.Linear(hidden_size, 7)
         )
 
         # Log-écarts-types entraînables, indépendants de l'observation, pour les quatre
