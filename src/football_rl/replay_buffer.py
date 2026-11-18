@@ -36,10 +36,12 @@ class ReplayBuffer:
         observation_size: Dimension du vecteur d'observation.
     """
 
-    def __init__(self, capacity: int, observation_size: int) -> None:
+    def __init__(self, capacity: int, observation_size: int, seed: int | None = None) -> None:
         self.capacity = capacity
         self._size = 0
         self._pos = 0
+        # Générateur dédié : avec une graine, l'ordre des mini-lots est reproductible.
+        self._rng = np.random.default_rng(seed)
 
         self._observations = np.zeros((capacity, observation_size), dtype=np.float32)
         self._actions = np.zeros(capacity, dtype=np.int64)
@@ -68,6 +70,32 @@ class ReplayBuffer:
         self._pos = (self._pos + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
 
+    def add_batch(
+        self,
+        observations: NDArray[np.float32],
+        actions: NDArray[np.integer],
+        rewards: NDArray[np.float32],
+        next_observations: NDArray[np.float32],
+        terminated: NDArray[np.bool_],
+    ) -> None:
+        """Ajoute N transitions d'un coup, dans l'ordre (les plus anciennes sont écrasées en premier)."""
+        n = len(actions)
+        if n == 0:
+            return
+        if n > self.capacity:  # seules les plus récentes tiennent dans le tampon
+            observations, actions, rewards = observations[-self.capacity:], actions[-self.capacity:], rewards[-self.capacity:]
+            next_observations, terminated = next_observations[-self.capacity:], terminated[-self.capacity:]
+            n = self.capacity
+        indices = (self._pos + np.arange(n)) % self.capacity
+        self._observations[indices] = observations
+        self._actions[indices] = actions
+        self._rewards[indices] = rewards
+        self._next_observations[indices] = next_observations
+        self._terminated[indices] = np.asarray(terminated, dtype=np.float32)
+
+        self._pos = int((self._pos + n) % self.capacity)
+        self._size = min(self._size + n, self.capacity)
+
     def sample(self, batch_size: int, device: torch.device) -> BatchTensors:
         """Échantillonne un lot aléatoire et le place sur le périphérique demandé.
 
@@ -80,7 +108,7 @@ class ReplayBuffer:
                 f"mais {batch_size} sont demandées."
             )
 
-        indices = np.random.default_rng().integers(0, self._size, size=batch_size)
+        indices = self._rng.integers(0, self._size, size=batch_size)
 
         return BatchTensors(
             observations=torch.from_numpy(self._observations[indices]).to(device),

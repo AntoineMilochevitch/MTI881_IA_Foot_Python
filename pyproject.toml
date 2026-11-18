@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 football-rl-train = "football_rl.train:main"
+football-rl-dqn = "football_rl.dqn_unity:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
